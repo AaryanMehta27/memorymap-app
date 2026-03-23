@@ -1,7 +1,17 @@
+import os
+import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import vision, query, floorplan
-import os
 
 app = FastAPI(title="MemoryMap AI Service")
 
