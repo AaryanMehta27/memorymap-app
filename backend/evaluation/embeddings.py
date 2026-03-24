@@ -16,16 +16,21 @@ Implements:
     Part 4 — Vector Operations (L2 norm, cosine similarity, euclidean distance)
     Part 5 — HybridRetriever (weighted combination of TF-IDF + BM25)
     Part 6 — TagRetriever (MemoryMap integration layer)
+    Part 7 — GloVe Semantic Embeddings (pre-trained word vectors for
+             vocabulary-mismatch bridging)
 
 References:
     - TF-IDF: Salton & Buckley, "Term-weighting approaches in automatic text
       retrieval", Information Processing & Management, 1988
     - BM25: Robertson & Zaragoza, "The Probabilistic Relevance Framework:
       BM25 and Beyond", Foundations and Trends in IR, 2009
+    - GloVe: Pennington, Socher & Manning, "GloVe: Global Vectors for Word
+      Representation", EMNLP 2014
     - Cosine Similarity: standard inner-product measure on unit vectors
 
 Dependencies:
     - numpy (matrix operations only — no ML libraries)
+    - gensim (ONLY for loading pre-trained GloVe vectors — we do all math ourselves)
     - Python standard library (math, re, collections)
 """
 
@@ -1305,30 +1310,472 @@ class BM25Retriever:
         return [self.doc_ids[i] for i in ranked_indices]
 
 
-class EmbeddingRetriever:
-    """
-    Retriever using the HybridRetriever (TF-IDF + BM25 combination).
+# ===========================================================================
+#  Part 7: GloVe Semantic Embeddings
+# ===========================================================================
+#
+#  THE VOCABULARY MISMATCH PROBLEM
+#  ===============================
+#  TF-IDF and BM25 are keyword-based: they only match when the exact same
+#  word (after stemming) appears in both the query and the document.
+#
+#  This fails for:
+#    - "pills" vs "medicine cabinet"  (synonyms)
+#    - "inhaler" vs "nebulizer"       (medical equivalents)
+#    - "TV clicker" vs "remote"       (colloquial vs formal)
+#
+#  Hardcoded synonym lists (Part 1) help for known cases but can't handle
+#  words we never anticipated. We need DENSE SEMANTIC VECTORS where words
+#  with similar meanings are close in vector space — automatically.
+#
+#  GloVe (Global Vectors for Word Representation) was trained on 6 billion
+#  tokens from Wikipedia + Gigaword. Each word becomes a 50-dimensional
+#  vector. Words that appear in similar contexts land near each other:
+#
+#    cosine("pill", "medication")  ≈ 0.82   (high — semantically related)
+#    cosine("pill", "shoe")        ≈ 0.12   (low — unrelated)
+#
+#  HOW WE USE GLOVE FOR DOCUMENT/QUERY EMBEDDING
+#  ==============================================
+#  1. Load pre-trained 50d vectors (400,000 words)
+#  2. To embed a document: tokenize → look up each word's GloVe vector →
+#     compute a weighted average (IDF-weighted, so rare words matter more)
+#  3. To embed a query: same process
+#  4. Rank by cosine similarity between query embedding and doc embeddings
+#
+#  This is the same core idea behind modern dense retrievers (DPR, ColBERT)
+#  but using static pre-trained vectors instead of a trained bi-encoder.
+#  We do ALL the math ourselves — GloVe just provides the word vectors.
 
-    This replaces the old SVD co-occurrence embeddings approach with
-    the more robust hybrid retrieval strategy. It serves as the
-    "embedding retriever" in the evaluation pipeline.
+import logging
+
+_glove_logger = logging.getLogger(__name__)
+
+# Singleton: loaded once, shared across all instances
+_glove_vectors: Optional[dict] = None
+_glove_dim: int = 50
+
+
+def load_glove(model_name: str = "glove-wiki-gigaword-50") -> dict:
+    """
+    Load pre-trained GloVe word vectors via gensim's downloader.
+
+    We use gensim ONLY as a convenience loader — it downloads and caches
+    the Stanford GloVe vectors. All similarity math is done by us in numpy.
+
+    The vectors are loaded once and cached in a module-level singleton.
+    Subsequent calls return instantly.
+
+    Args:
+        model_name: gensim model identifier. Default is GloVe 6B 50d
+                    (400K words, 50 dimensions, ~66MB download).
+
+    Returns:
+        A gensim KeyedVectors object (used only for word→vector lookup).
+    """
+    global _glove_vectors, _glove_dim
+    if _glove_vectors is not None:
+        return _glove_vectors
+
+    try:
+        import gensim.downloader as api
+        _glove_logger.info("Loading GloVe vectors (%s)...", model_name)
+        _glove_vectors = api.load(model_name)
+        _glove_dim = _glove_vectors.vector_size
+        _glove_logger.info(
+            "GloVe loaded: %d words, %d dimensions",
+            len(_glove_vectors), _glove_dim,
+        )
+        return _glove_vectors
+    except Exception as e:
+        _glove_logger.warning("Failed to load GloVe: %s. Falling back to keyword-only.", e)
+        return None
+
+
+def glove_embed_word(word: str, vectors=None) -> Optional[np.ndarray]:
+    """
+    Look up a single word's GloVe vector.
+
+    Args:
+        word: a lowercase word (NOT stemmed — GloVe was trained on raw words)
+        vectors: pre-loaded GloVe vectors (if None, loads the singleton)
+
+    Returns:
+        np.ndarray of shape [50] or None if word is not in vocabulary.
+    """
+    if vectors is None:
+        vectors = load_glove()
+    if vectors is None:
+        return None
+    try:
+        return vectors[word]
+    except KeyError:
+        return None
+
+
+def glove_embed_sentence(
+    text: str,
+    vectors=None,
+    use_idf_weights: bool = True,
+    idf: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    Embed a sentence/document as the weighted average of its word vectors.
+
+    This is sometimes called a "bag-of-vectors" embedding. Each word in the
+    text is mapped to its GloVe vector, then all vectors are averaged. If
+    IDF weights are provided, rare words get proportionally more influence.
+
+    Mathematically:
+        embed(text) = Σ (idf(w) * GloVe(w)) / Σ idf(w)
+
+    If no IDF is available, all words are weighted equally (simple average).
+
+    NOTE: We tokenize WITHOUT stemming here, because GloVe was trained on
+    raw English words. "medicine" has a GloVe vector; "medicin" does not.
+
+    Args:
+        text: raw input text
+        vectors: pre-loaded GloVe vectors
+        use_idf_weights: whether to weight by IDF (default True)
+        idf: IDF dict from our TF-IDF module. If None, uniform weighting.
+
+    Returns:
+        np.ndarray of shape [50]. Zero vector if no words have GloVe entries.
+    """
+    if vectors is None:
+        vectors = load_glove()
+    if vectors is None:
+        return np.zeros(_glove_dim, dtype=np.float64)
+
+    # Tokenize WITHOUT stemming — GloVe needs raw words
+    text_lower = text.lower()
+    raw_tokens = re.findall(r"[a-z]+", text_lower)
+    raw_tokens = [t for t in raw_tokens if t not in STOPWORDS and len(t) > 1]
+
+    if not raw_tokens:
+        return np.zeros(_glove_dim, dtype=np.float64)
+
+    weighted_sum = np.zeros(_glove_dim, dtype=np.float64)
+    total_weight = 0.0
+
+    for word in raw_tokens:
+        vec = glove_embed_word(word, vectors)
+        if vec is not None:
+            # IDF weighting: rare words contribute more to the embedding
+            weight = 1.0
+            if use_idf_weights and idf:
+                # Try the stemmed form for IDF lookup (our IDF uses stems)
+                stemmed = stem(word)
+                weight = idf.get(stemmed, 1.0)
+
+            weighted_sum += weight * vec.astype(np.float64)
+            total_weight += weight
+
+    if total_weight == 0.0:
+        return np.zeros(_glove_dim, dtype=np.float64)
+
+    # Average (weighted mean of word vectors)
+    embedding = weighted_sum / total_weight
+
+    return embedding
+
+
+class GloVeRetriever:
+    """
+    Dense semantic retriever using pre-trained GloVe word vectors.
+
+    Unlike TF-IDF/BM25 (which match on exact token overlap), this retriever
+    captures semantic similarity: "pills" will match "medicine cabinet"
+    because their GloVe vectors are close in 50-dimensional space.
+
+    Pipeline:
+        1. Convert each document to a 50d vector (IDF-weighted average of
+           word vectors)
+        2. Convert query to a 50d vector
+        3. Compute cosine similarity between query vector and all doc vectors
+        4. Rank by similarity
+
+    This is conceptually the same as how modern dense passage retrievers
+    (DPR, ColBERT) work, but using static pre-trained vectors instead of
+    a fine-tuned bi-encoder. The math is identical — only the vector source
+    differs.
     """
 
-    def __init__(self, embedding_dim: int = 32):
+    def __init__(self, documents: list[str], doc_metadata: Optional[list[dict]] = None):
+        """
+        Build the GloVe document index.
+
+        Args:
+            documents: list of raw text strings to index
+            doc_metadata: optional metadata dicts (returned with results)
+        """
+        self.documents = documents
+        self.doc_metadata = doc_metadata or [{} for _ in documents]
+        self.vectors = load_glove()
+        self.n_docs = len(documents)
+
+        # Build IDF from the corpus (used for weighted averaging)
+        corpus_tokens = [tokenize(doc) for doc in documents]
+        self._idf = compute_idf(corpus_tokens)
+
+        # Pre-compute document embeddings — each doc becomes a 50d vector
+        self.doc_matrix = np.zeros((self.n_docs, _glove_dim), dtype=np.float64)
+        for i, doc in enumerate(documents):
+            self.doc_matrix[i] = glove_embed_sentence(
+                doc, self.vectors, use_idf_weights=True, idf=self._idf
+            )
+
+        # L2-normalize all document vectors for efficient cosine similarity
+        # After normalization: cosine_sim(a, b) = dot(a, b)
+        norms = np.linalg.norm(self.doc_matrix, axis=1, keepdims=True)
+        # Avoid division by zero for empty docs
+        norms = np.where(norms == 0, 1, norms)
+        self.doc_matrix_normed = self.doc_matrix / norms
+
+        _glove_logger.info(
+            "GloVeRetriever indexed %d documents into %dd vectors",
+            self.n_docs, _glove_dim,
+        )
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
+        """
+        Retrieve the most semantically similar documents for a query.
+
+        Args:
+            query: raw query string (e.g., "Where are my pills?")
+            top_k: number of results to return
+
+        Returns:
+            List of dicts with: doc_index, score, metadata
+        """
+        # Embed query into same 50d space
+        query_vec = glove_embed_sentence(
+            query, self.vectors, use_idf_weights=True, idf=self._idf
+        )
+
+        # L2-normalize the query vector
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm == 0:
+            return []
+        query_vec_normed = query_vec / query_norm
+
+        # Cosine similarity = dot product of normalized vectors
+        # This is a single matrix-vector multiply: O(n_docs * 50)
+        similarities = self.doc_matrix_normed @ query_vec_normed
+
+        # Rank by similarity (descending)
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            results.append({
+                "doc_index": int(idx),
+                "score": float(similarities[idx]),
+                "metadata": self.doc_metadata[int(idx)],
+            })
+
+        return results
+
+    def explain(self, query: str, doc_index: int) -> dict:
+        """
+        Explain why a document scored the way it did.
+
+        Shows the closest words between the query and document by
+        comparing individual word vectors.
+        """
+        if self.vectors is None:
+            return {"error": "GloVe not loaded"}
+
+        query_lower = query.lower()
+        doc_lower = self.documents[doc_index].lower()
+
+        q_words = [w for w in re.findall(r"[a-z]+", query_lower)
+                    if w not in STOPWORDS and len(w) > 1]
+        d_words = [w for w in re.findall(r"[a-z]+", doc_lower)
+                    if w not in STOPWORDS and len(w) > 1]
+
+        # Find closest word pairs between query and document
+        word_pairs = []
+        for qw in q_words:
+            qv = glove_embed_word(qw, self.vectors)
+            if qv is None:
+                continue
+            best_dw, best_sim = None, -1.0
+            for dw in d_words:
+                dv = glove_embed_word(dw, self.vectors)
+                if dv is None:
+                    continue
+                sim = cosine_similarity(qv.astype(np.float64), dv.astype(np.float64))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_dw = dw
+            if best_dw is not None:
+                word_pairs.append({
+                    "query_word": qw,
+                    "doc_word": best_dw,
+                    "similarity": round(best_sim, 4),
+                })
+
+        # Overall score
+        query_vec = glove_embed_sentence(query, self.vectors, use_idf_weights=True, idf=self._idf)
+        qn = np.linalg.norm(query_vec)
+        doc_vec = self.doc_matrix[doc_index]
+        dn = np.linalg.norm(doc_vec)
+        overall = float(np.dot(query_vec, doc_vec) / (qn * dn)) if qn > 0 and dn > 0 else 0.0
+
+        return {
+            "query_words": q_words,
+            "doc_words": d_words,
+            "word_pairs": sorted(word_pairs, key=lambda x: x["similarity"], reverse=True),
+            "overall_similarity": round(overall, 4),
+        }
+
+
+class SemanticHybridRetriever:
+    """
+    The full retrieval pipeline: combines keyword matching (BM25) with
+    semantic similarity (GloVe) for robust retrieval.
+
+    This addresses both:
+    - Exact matches: BM25 finds "shoe rack" when query says "shoe"
+    - Semantic matches: GloVe finds "medicine cabinet" when query says "pills"
+
+    Score fusion:
+        final_score = bm25_weight * norm(bm25_score)
+                    + glove_weight * norm(glove_score)
+
+    Both score vectors are min-max normalized to [0,1] before combining,
+    so neither component dominates regardless of raw score ranges.
+    """
+
+    def __init__(
+        self,
+        documents: list[str],
+        doc_metadata: Optional[list[dict]] = None,
+        bm25_weight: float = 0.4,
+        glove_weight: float = 0.6,
+    ):
         """
         Args:
-            embedding_dim: ignored (kept for API compatibility with run_eval.py).
-                           The hybrid retriever doesn't use fixed-dim embeddings.
+            documents: list of raw text strings
+            doc_metadata: optional metadata for each document
+            bm25_weight: weight for keyword matching (BM25)
+            glove_weight: weight for semantic matching (GloVe)
+        """
+        self.documents = documents
+        self.doc_metadata = doc_metadata or [{} for _ in documents]
+        self.bm25_weight = bm25_weight
+        self.glove_weight = glove_weight
+        self.n_docs = len(documents)
+
+        # Build both retrieval components
+        self.bm25 = BM25Index(documents)
+        self.glove_retriever = GloVeRetriever(documents, doc_metadata)
+
+    @staticmethod
+    def _min_max_normalize(scores: np.ndarray) -> np.ndarray:
+        """Normalize scores to [0, 1] range."""
+        s_min = scores.min()
+        s_max = scores.max()
+        if s_max - s_min == 0:
+            return np.zeros_like(scores)
+        return (scores - s_min) / (s_max - s_min)
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
+        """
+        Retrieve using combined BM25 + GloVe scoring.
+
+        Returns:
+            List of dicts with: doc_index, score, bm25_score, glove_score, metadata
+        """
+        # BM25 scores (keyword matching)
+        bm25_scores = self.bm25.score(query)
+
+        # GloVe scores (semantic similarity)
+        query_vec = glove_embed_sentence(
+            query,
+            self.glove_retriever.vectors,
+            use_idf_weights=True,
+            idf=self.glove_retriever._idf,
+        )
+        qn = np.linalg.norm(query_vec)
+        if qn > 0:
+            query_normed = query_vec / qn
+            glove_scores = self.glove_retriever.doc_matrix_normed @ query_normed
+        else:
+            glove_scores = np.zeros(self.n_docs, dtype=np.float64)
+
+        # Min-max normalize both to [0, 1]
+        bm25_normed = self._min_max_normalize(bm25_scores)
+        glove_normed = self._min_max_normalize(glove_scores)
+
+        # Weighted combination
+        combined = (self.bm25_weight * bm25_normed) + (self.glove_weight * glove_normed)
+
+        # Rank and return top-k
+        top_indices = np.argsort(combined)[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            results.append({
+                "doc_index": int(idx),
+                "score": float(combined[idx]),
+                "bm25_score": float(bm25_scores[idx]),
+                "glove_score": float(glove_scores[idx]),
+                "metadata": self.doc_metadata[int(idx)],
+            })
+
+        return results
+
+    def explain(self, query: str, doc_index: int) -> dict:
+        """Full explanation combining BM25 term matches + GloVe word pair similarities."""
+        glove_explanation = self.glove_retriever.explain(query, doc_index)
+
+        bm25_scores = self.bm25.score(query)
+        query_tokens = tokenize(query)
+        expanded = expand_query(query_tokens)
+        matching_terms = []
+        for tok, weight in expanded:
+            if tok in self.bm25.idf:
+                for di, doc_tokens in enumerate(self.bm25.doc_tokens):
+                    if di == doc_index and tok in doc_tokens:
+                        matching_terms.append({"term": tok, "weight": weight, "source": "original" if weight == 1.0 else "synonym"})
+                        break
+
+        return {
+            "bm25_score": float(bm25_scores[doc_index]),
+            "bm25_matching_terms": matching_terms,
+            "glove_similarity": glove_explanation["overall_similarity"],
+            "glove_word_pairs": glove_explanation["word_pairs"][:5],
+        }
+
+
+class EmbeddingRetriever:
+    """
+    The main retriever: combines BM25 keyword matching + GloVe semantic
+    similarity via SemanticHybridRetriever.
+
+    This is the "best of both worlds" approach:
+    - BM25 handles exact matches ("shoe" → "shoe rack")
+    - GloVe handles vocabulary mismatch ("pills" → "medicine cabinet")
+
+    Used by the evaluation pipeline and the live query endpoint.
+    """
+
+    def __init__(self, embedding_dim: int = 50):
+        """
+        Args:
+            embedding_dim: GloVe vector dimension (default 50).
         """
         self.embedding_dim = embedding_dim
-        self.retriever: Optional[HybridRetriever] = None
+        self.retriever: Optional[SemanticHybridRetriever] = None
         self.doc_ids: list[str] = []
         self.vocabulary: dict[str, int] = {}
 
     @property
     def embedder(self):
-        """Compatibility shim for run_eval.py which accesses .embedder.vocabulary
-        and .embedder.embedding_dim."""
+        """Compatibility shim for run_eval.py."""
 
         class _Shim:
             pass
@@ -1349,15 +1796,15 @@ class EmbeddingRetriever:
             self.doc_ids.append(tag["id"])
             metadata.append(tag)
 
-        self.retriever = HybridRetriever(
+        self.retriever = SemanticHybridRetriever(
             documents=documents,
             doc_metadata=metadata,
-            tfidf_weight=0.4,
-            bm25_weight=0.6,
+            bm25_weight=0.4,
+            glove_weight=0.6,
         )
 
-        # Store vocabulary for the compatibility shim
-        self.vocabulary = self.retriever.vocab
+        # Build vocab from BM25 component for compatibility
+        self.vocabulary = {term: i for i, term in enumerate(sorted(self.retriever.bm25.idf.keys()))}
 
         return self
 
@@ -1368,6 +1815,27 @@ class EmbeddingRetriever:
     def retrieve_with_scores(self, query: str) -> list[tuple[str, float]]:
         results = self.retriever.retrieve(query, top_k=len(self.doc_ids))
         return [(self.doc_ids[r["doc_index"]], r["score"]) for r in results]
+
+    def explain(self, query: str) -> str:
+        """Human-readable explanation of retrieval."""
+        if self.retriever is None:
+            return "Retriever not fitted yet."
+        results = self.retriever.retrieve(query, top_k=5)
+        lines = [f"Query: \"{query}\"\n"]
+        for i, r in enumerate(results):
+            meta = r["metadata"]
+            lines.append(
+                f"  #{i+1} [{meta.get('id','?')}] {meta.get('label','?')} ({meta.get('room_name','?')})\n"
+                f"       Combined: {r['score']:.4f}  |  BM25: {r['bm25_score']:.4f}  |  GloVe: {r['glove_score']:.4f}"
+            )
+            # Show word-level explanation for top result
+            if i == 0:
+                expl = self.retriever.explain(query, r["doc_index"])
+                if expl.get("glove_word_pairs"):
+                    pairs = expl["glove_word_pairs"][:3]
+                    pair_strs = [f"{p['query_word']}<->{p['doc_word']}({p['similarity']:.2f})" for p in pairs]
+                    lines.append(f"       GloVe bridges: {', '.join(pair_strs)}")
+        return "\n".join(lines)
 
 
 # ===========================================================================
@@ -1432,105 +1900,110 @@ if __name__ == "__main__":
         },
     ]
 
-    # ---- Build the TagRetriever ----
-    print("\n[1] Building TagRetriever index...")
+    # ==================================================================
+    # PART A: Keyword-only retrieval (BM25 + TF-IDF + synonym expansion)
+    # ==================================================================
+    print("\n[1] Building keyword-only TagRetriever...")
     tag_retriever = TagRetriever(sample_tags)
     print(f"    Indexed {len(sample_tags)} tags")
     print(f"    Vocabulary size: {len(tag_retriever.retriever.vocab)}")
 
-    # ---- Run sample queries ----
     queries = [
         "Where are my blood pressure pills?",
         "Where did I put my keys?",
         "I need to find my shoes",
         "Where is the milk?",
         "I want to heat up some leftovers",
+        "Where's my inhaler?",          # never appears in any tag
+        "I need my reading spectacles",  # synonym for glasses
     ]
 
-    print(f"\n[2] Running {len(queries)} sample queries...\n")
-
+    print(f"\n[2] Keyword-only results ({len(queries)} queries)...\n")
     for query in queries:
         print("=" * 70)
         print(tag_retriever.explain(query))
 
-    # ---- Demonstrate individual components ----
+    # ==================================================================
+    # PART B: GloVe semantic retrieval — the key improvement
+    # ==================================================================
     print("\n" + "=" * 70)
-    print("[3] Component demonstrations")
+    print("[3] GloVe Semantic Retrieval")
+    print("    Loading pre-trained GloVe vectors (400K words, 50 dimensions)...")
     print("=" * 70)
 
-    # Tokenization
-    text = "Where are my running shoes in the Entryway?"
-    print(f"\n  Tokenize: \"{text}\"")
-    print(f"  Result:   {tokenize(text)}")
+    glove = load_glove()
+    if glove is not None:
+        # Show word similarity examples
+        print("\n  Word vector similarities (no hardcoding — learned from data):")
+        word_pairs = [
+            ("pill", "medicine"),
+            ("pill", "shoe"),
+            ("inhaler", "nebulizer"),
+            ("remote", "controller"),
+            ("fridge", "refrigerator"),
+            ("glasses", "spectacles"),
+            ("key", "lock"),
+        ]
+        for w1, w2 in word_pairs:
+            v1 = glove_embed_word(w1, glove)
+            v2 = glove_embed_word(w2, glove)
+            if v1 is not None and v2 is not None:
+                sim = cosine_similarity(v1.astype(np.float64), v2.astype(np.float64))
+                bar = "#" * int(sim * 30) + "." * (30 - int(sim * 30))
+                print(f"    {w1:15s} <-> {w2:15s}  [{bar}] {sim:.4f}")
+            else:
+                missing = w1 if v1 is None else w2
+                print(f"    {w1:15s} <-> {w2:15s}  ('{missing}' not in GloVe)")
 
-    # Stemming examples
-    print("\n  Stemming examples:")
-    test_words = ["running", "walked", "education", "happiness", "medicines",
-                  "cabinets", "quickly", "normalization", "beautiful"]
+        # Build the full semantic hybrid retriever
+        print(f"\n[4] Semantic Hybrid Retriever (BM25 + GloVe)")
+        print("    This handles words we NEVER anticipated...\n")
+
+        semantic_retriever = EmbeddingRetriever()
+        semantic_retriever.fit(sample_tags)
+
+        for query in queries:
+            print("=" * 70)
+            print(semantic_retriever.explain(query))
+            print()
+
+    else:
+        print("\n  GloVe not available — run 'python -c \"import gensim.downloader as api; api.load(\\\"glove-wiki-gigaword-50\\\")\"' first")
+
+    # ==================================================================
+    # PART C: Component demonstrations (math from scratch)
+    # ==================================================================
+    print("\n" + "=" * 70)
+    print("[5] Component demonstrations — all math from scratch")
+    print("=" * 70)
+
+    # Stemming
+    print("\n  Stemmer (suffix-stripping, no external libraries):")
+    test_words = ["running", "walked", "medicines", "shoes", "boxes",
+                  "glasses", "cabinets", "quickly", "beautiful"]
     for w in test_words:
         print(f"    {w:20s} -> {stem(w)}")
 
-    # TF-IDF matrix
-    sample_docs = [
-        "medicine cabinet bathroom",
-        "kitchen pantry fridge",
-        "shoe rack entryway door",
-    ]
-    print(f"\n  TF-IDF matrix for {len(sample_docs)} mini-docs:")
-    matrix, vocab, idf = build_tfidf_matrix(sample_docs)
-    print(f"    Shape: {matrix.shape}")
-    print(f"    Vocab: {vocab}")
-    print(f"    IDF values: {dict(sorted(idf.items(), key=lambda x: -x[1])[:5])}")
-
-    # BM25 scoring
-    print("\n  BM25 scoring:")
-    bm25 = BM25Index(sample_docs)
-    query = "medicine cabinet"
-    scores = bm25.score(query)
-    print(f"    Query: \"{query}\"")
-    print(f"    Scores: {scores}")
-    print(f"    Ranking: {bm25.rank(query, top_k=3)}")
-
     # Vector operations
-    print("\n  Vector operations:")
+    print("\n  Vector operations (numpy only):")
     v1 = np.array([1.0, 2.0, 3.0])
     v2 = np.array([2.0, 4.0, 6.0])
     v3 = np.array([3.0, 0.0, 0.0])
-    print(f"    v1 = {v1}")
-    print(f"    v2 = {v2}  (parallel to v1)")
-    print(f"    v3 = {v3}  (mostly orthogonal to v1)")
-    print(f"    l2_normalize(v1) = {l2_normalize(v1)}")
-    print(f"    cosine_sim(v1, v2) = {cosine_similarity(v1, v2):.4f}  (should be 1.0)")
-    print(f"    cosine_sim(v1, v3) = {cosine_similarity(v1, v3):.4f}  (should be low)")
-    print(f"    euclidean_dist(v1, v2) = {euclidean_distance(v1, v2):.4f}")
-    print(f"    euclidean_dist(v1, v3) = {euclidean_distance(v1, v3):.4f}")
+    print(f"    l2_normalize([1,2,3])      = {l2_normalize(v1)}")
+    print(f"    cosine_sim(v, 2*v)         = {cosine_similarity(v1, v2):.4f}  (parallel = 1.0)")
+    print(f"    cosine_sim(v, orthogonal)  = {cosine_similarity(v1, v3):.4f}  (should be low)")
+    print(f"    euclidean_dist(v1, v2)     = {euclidean_distance(v1, v2):.4f}")
+    print(f"    cosine_sim(zero, v1)       = {cosine_similarity(np.zeros(3), v1):.4f}  (zero vec handled)")
 
-    # Batch cosine similarity
-    print("\n  Batch cosine similarity:")
-    doc_mat = np.array([[1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=np.float64)
-    qvec = np.array([1.0, 0.0, 0.0])
-    print(f"    query = {qvec}")
-    print(f"    doc_matrix = {doc_mat.tolist()}")
-    print(f"    similarities = {batch_cosine_similarity(qvec, doc_mat)}")
+    # TF-IDF
+    sample_docs = ["medicine cabinet bathroom", "kitchen pantry fridge", "shoe rack entryway door"]
+    matrix, vocab, idf_vals = build_tfidf_matrix(sample_docs)
+    print(f"\n  TF-IDF matrix ({matrix.shape[0]} docs, {matrix.shape[1]} terms):")
+    print(f"    Vocab: {vocab}")
 
-    # Edge cases
-    print("\n  Edge cases:")
-    print(f"    cosine_sim(zero, v1) = {cosine_similarity(np.zeros(3), v1)}")
-    print(f"    tokenize('') = {tokenize('')}")
-    print(f"    tokenize('the is a') = {tokenize('the is a')}  (all stopwords)")
-
-    # Explain retrieval
-    print("\n  Explain retrieval (tag-001 for 'blood pressure pills'):")
-    explanation = tag_retriever.retriever.explain_retrieval(
-        "Where are my blood pressure pills?", 0
-    )
-    print(f"    Query tokens: {explanation['query_tokens']}")
-    print(f"    Doc tokens:   {explanation['doc_tokens']}")
-    print(f"    Matching:     {explanation['matching_terms']}")
-    print(f"    Unmatched:    {explanation['non_matching_query_terms']}")
-    print(f"    TF-IDF sim:   {explanation['tfidf_cosine_sim']:.4f}")
-    print(f"    BM25 score:   {explanation['bm25_total_score']:.4f}")
-    print(f"    Combined:     {explanation['combined_score']:.4f}")
+    # BM25
+    bm25 = BM25Index(sample_docs)
+    print(f"\n  BM25 scores for 'medicine cabinet': {bm25.score('medicine cabinet')}")
 
     print("\n" + "=" * 70)
     print("  Demo complete.")
