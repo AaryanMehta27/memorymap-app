@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import time
+import asyncio
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -56,14 +57,17 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
     """Send image to Gemini for object detection. Returns parsed dict."""
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
+    def _call_vision(prompt, part):
+        return _get_client().models.generate_content(
+            model=VISION_MODEL,
+            contents=[prompt, part],
+            config=types.GenerateContentConfig(
+                system_instruction=PRIVACY_SYSTEM_INSTRUCTION,
+            ),
+        )
+
     start = time.time()
-    response = _get_client().models.generate_content(
-        model=VISION_MODEL,
-        contents=[VISION_PROMPT, image_part],
-        config=types.GenerateContentConfig(
-            system_instruction=PRIVACY_SYSTEM_INSTRUCTION,
-        ),
-    )
+    response = await asyncio.to_thread(_call_vision, VISION_PROMPT, image_part)
     latency = time.time() - start
 
     logger.info(
@@ -79,13 +83,7 @@ async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
 
     # Retry once with stricter prompt
     start = time.time()
-    response = _get_client().models.generate_content(
-        model=VISION_MODEL,
-        contents=[VISION_RETRY_PROMPT, image_part],
-        config=types.GenerateContentConfig(
-            system_instruction=PRIVACY_SYSTEM_INSTRUCTION,
-        ),
-    )
+    response = await asyncio.to_thread(_call_vision, VISION_RETRY_PROMPT, image_part)
     latency = time.time() - start
     logger.info(
         "gemini_vision_retry model=%s latency=%.2fs",
@@ -110,14 +108,17 @@ async def query_with_context(context: str, question: str) -> str:
 
     prompt = f"Home layout data:\n{context}\n\nQuestion: {question}"
 
+    def _call_query():
+        return _get_client().models.generate_content(
+            model=TEXT_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+            ),
+        )
+
     start = time.time()
-    response = _get_client().models.generate_content(
-        model=TEXT_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-        ),
-    )
+    response = await asyncio.to_thread(_call_query)
     latency = time.time() - start
 
     logger.info(
@@ -150,14 +151,17 @@ async def suggest_positions(
         f'Return ONLY valid JSON: {{"placements": [{{"tag_id": "...", "label": "...", "x": 0, "y": 0}}]}}'
     )
 
+    def _call_floorplan():
+        return _get_client().models.generate_content(
+            model=TEXT_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+            ),
+        )
+
     start = time.time()
-    response = _get_client().models.generate_content(
-        model=TEXT_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-        ),
-    )
+    response = await asyncio.to_thread(_call_floorplan)
     latency = time.time() - start
 
     logger.info(
