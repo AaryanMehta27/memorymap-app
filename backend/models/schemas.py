@@ -52,6 +52,9 @@ class QueryResponse(BaseModel):
     answer: str
     source_tags: list[SourceTag]
     confidence: ConfidenceLevel
+    redirect_message: Optional[str] = None
+    is_repeat: bool = False
+    drift_detected: bool = False
 
 
 # --- Floorplan ---
@@ -73,8 +76,8 @@ class FloorplanRequest(BaseModel):
 class TagPlacement(BaseModel):
     tag_id: str
     label: str
-    x: int
-    y: int
+    x: float
+    y: float
 
 
 class FloorplanResponse(BaseModel):
@@ -99,3 +102,18 @@ class SweepResponse(BaseModel):
     room_id: str
     tags: list[Tag]
     raw_description: str
+
+
+# --- Alerts ---
+
+class AlertResponse(BaseModel):
+    id: str
+    level: str
+    message: str
+    alert_type: str
+    timestamp: str
+    acknowledged: bool = False
+
+
+class AlertListResponse(BaseModel):
+    alerts: list[AlertResponse]

@@ -4,6 +4,7 @@ Retriever module for MemoryMap RAG evaluation.
 Implements tag retrieval strategies that simulate what query.py does:
 1. Keyword matching (baseline)
 2. Gemini-powered semantic matching (production approach)
+3. Embedding-based hybrid retrieval (TF-IDF + BM25, from embeddings.py)
 
 The retriever takes a patient question and a list of available tags,
 and returns an ordered list of the most relevant tags.
@@ -128,3 +129,59 @@ async def gemini_answer_and_extract_tags(
             referenced.append(tag["id"])
 
     return answer, referenced
+
+
+# ===========================================================================
+#  Embedding-based Hybrid Retriever (wraps embeddings.py HybridRetriever)
+# ===========================================================================
+
+class EmbeddingRetriever:
+    """
+    Retriever that uses the custom HybridRetriever from embeddings.py.
+
+    This wraps the hand-crafted TF-IDF + BM25 hybrid system so it can
+    be evaluated alongside the keyword and Gemini retrievers in the
+    evaluation pipeline.
+
+    The interface matches keyword_retrieve() — takes a question and tags,
+    returns an ordered list of tag IDs.
+    """
+
+    def __init__(self, tfidf_weight: float = 0.4, bm25_weight: float = 0.6):
+        self.tfidf_weight = tfidf_weight
+        self.bm25_weight = bm25_weight
+        self._tag_retriever = None
+
+    def fit(self, tags: list[dict]) -> "EmbeddingRetriever":
+        """Build the hybrid index on the provided tags."""
+        from evaluation.embeddings import TagRetriever
+
+        self._tag_retriever = TagRetriever(tags)
+        # Override weights if non-default
+        self._tag_retriever.retriever.tfidf_weight = self.tfidf_weight
+        self._tag_retriever.retriever.bm25_weight = self.bm25_weight
+        return self
+
+    def retrieve(self, question: str, tags: list[dict]) -> list[str]:
+        """
+        Retrieve ranked tag IDs for a patient question.
+
+        If fit() has not been called yet, it will be called automatically
+        with the provided tags (lazy initialization).
+
+        Args:
+            question: patient's natural language question
+            tags: list of tag dicts (used for lazy init if needed)
+
+        Returns:
+            List of tag ID strings, ordered by relevance (best first).
+        """
+        if self._tag_retriever is None:
+            self.fit(tags)
+        return self._tag_retriever.find_relevant_tag_ids(question, top_k=len(tags))
+
+    def explain(self, question: str) -> str:
+        """Get human-readable explanation of retrieval. Must call fit() first."""
+        if self._tag_retriever is None:
+            raise RuntimeError("Call fit() before explain()")
+        return self._tag_retriever.explain(question)

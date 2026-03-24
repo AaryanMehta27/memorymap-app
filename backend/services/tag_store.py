@@ -26,13 +26,20 @@ async def save_tags(room_id: str, photo_id: str, tags: list[dict]) -> list[dict]
     client = _get_client()
     rows = []
     for tag in tags:
+        # Ensure confidence is a plain string matching CHECK constraint
+        conf = tag["confidence"]
+        if hasattr(conf, "value"):
+            conf = conf.value  # handle enum objects
+        if conf not in ("high", "medium", "low"):
+            conf = "medium"
+
         row = {
             "id": tag.get("id", str(uuid.uuid4())),
             "photo_id": photo_id,
             "room_id": room_id,
             "label": tag["label"],
             "position": tag["position"],
-            "confidence": tag["confidence"],
+            "confidence": conf,
             "notes": tag.get("notes", ""),
         }
         rows.append(row)

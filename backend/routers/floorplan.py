@@ -46,8 +46,8 @@ async def suggest_tag_positions(
             TagPlacement(
                 tag_id=p["tag_id"],
                 label=p["label"],
-                x=max(0, min(int(p["x"]), request.room_width_px)),
-                y=max(0, min(int(p["y"]), request.room_height_px)),
+                x=max(0.0, min(float(p["x"]), float(request.room_width_px))),
+                y=max(0.0, min(float(p["y"]), float(request.room_height_px))),
             )
         )
 

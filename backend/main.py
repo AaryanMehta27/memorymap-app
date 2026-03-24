@@ -11,7 +11,7 @@ logging.basicConfig(
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import vision, query, floorplan
+from routers import vision, query, floorplan, alerts
 
 app = FastAPI(title="MemoryMap AI Service")
 
@@ -26,6 +26,7 @@ app.add_middleware(
 app.include_router(vision.router, prefix="/api/vision")
 app.include_router(query.router, prefix="/api/query")
 app.include_router(floorplan.router, prefix="/api/floorplan")
+app.include_router(alerts.router, prefix="/api/alerts")
 
 
 @app.get("/health")
