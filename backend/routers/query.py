@@ -18,9 +18,11 @@ from services.tag_lifecycle import (
     detect_removal,
     detect_contradiction,
     handle_contradiction,
+    handle_relocation,
     update_tag_location,
     get_effective_confidence,
     get_confidence_note,
+    get_in_memory_tags,
     generate_reconfirmation_prompt,
     get_stale_tags,
 )
@@ -87,26 +89,9 @@ async def ask_question(
     # ------------------------------------------------------------------
     # 1. Check for relocation intent
     # ------------------------------------------------------------------
-    relocation = detect_relocation(question)
-    if relocation:
-        item_key = relocation["item"].lower()
-        matched_tag = tag_lookup.get(item_key)
-
-        if matched_tag:
-            update_tag_location(
-                tag_id=matched_tag["id"],
-                new_position=relocation["new_location"],
-            )
-            answer = (
-                f"Got it! I've updated your {relocation['item']} location to "
-                f"{relocation['new_location']}. I'll remember that for next time."
-            )
-        else:
-            answer = (
-                f"Thanks for letting me know! I don't have your {relocation['item']} "
-                f"tagged yet, but I'll let your caregiver know so they can add it."
-            )
-
+    relocation_result = await handle_relocation(question, home_id)
+    if relocation_result:
+        answer = relocation_result["message"]
         session.add_message("assistant", answer)
         await _maybe_save_session(session)
 
@@ -223,6 +208,15 @@ async def ask_question(
             is_repeat=is_repeat,
             drift_detected=drift_detected,
         )
+
+    # Include any in-memory conversational tags (items reported by patient
+    # that couldn't be saved to Supabase)
+    memory_tags = get_in_memory_tags()
+    for mt in memory_tags:
+        label = mt.get("label", "").lower()
+        if label and label not in tag_lookup:
+            tags.append(mt)
+            tag_lookup[label] = mt
 
     # Build context with confidence decay annotations
     context_lines: list[str] = []

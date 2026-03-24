@@ -167,7 +167,12 @@ _RELOCATION_PATTERNS: list[re.Pattern] = [
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:my\s+|the\s+)?(?P<item>.+?)\s+is\s+on\s+(?:the\s+)?(?P<location>.+?)\s+now",
+        r"(?:my\s+|the\s+)?(?P<item>.+?)\s+(?:is|are)\s+on\s+(?:the\s+)?(?P<location>.+?)\s+now",
+        re.IGNORECASE,
+    ),
+    # "My X are/is on/in the Y" (without trailing "now")
+    re.compile(
+        r"(?:my\s+|the\s+)(?P<item>.+?)\s+(?:is|are)\s+(?:in|on)\s+(?:the\s+)?(?P<location>.+)",
         re.IGNORECASE,
     ),
 ]
@@ -221,6 +226,212 @@ def update_tag_location(
     except Exception as exc:
         logger.warning("tag_location_update_failed tag_id=%s error=%s", tag_id, exc)
         return {"updated": False, "error": str(exc)}
+
+
+def find_tag_by_item(item: str, home_id: str) -> Optional[dict]:
+    """
+    Search existing tags for one matching the given item name.
+
+    Uses a case-insensitive substring match on the tag label. For example,
+    if the patient says "I put the milk on the counter", we search for
+    any tag whose label contains "milk".
+
+    Args:
+        item: the item name extracted from the patient's message
+        home_id: the patient's home ID
+
+    Returns:
+        The matching tag dict, or None if no match found.
+    """
+    try:
+        client = _get_client()
+        result = (
+            client.table("tags")
+            .select("*, rooms!inner(name, home_id)")
+            .eq("rooms.home_id", home_id)
+            .ilike("label", f"%{item}%")
+            .execute()
+        )
+        if result.data:
+            logger.info("find_tag_by_item found=%s for item=%s", result.data[0]["id"], item)
+            return result.data[0]
+    except Exception as exc:
+        logger.warning("find_tag_by_item_failed item=%s error=%s", item, exc)
+    return None
+
+
+def create_conversational_tag(
+    item: str,
+    location: str,
+    home_id: str,
+    room_id: Optional[str] = None,
+) -> dict:
+    """
+    Create a NEW tag from conversational input.
+
+    When a patient says "I put the milk on the kitchen counter" and there's
+    no existing "milk" tag, we create one. This way, next time they ask
+    "where is my milk?", the retriever finds it via direct keyword match.
+
+    These conversational tags have source="conversation" to distinguish them
+    from vision-pipeline tags (source="vision"). Confidence starts at "high"
+    because the patient just told us where it is.
+
+    Args:
+        item: the item name (e.g., "milk", "reading glasses")
+        location: where they said it is (e.g., "kitchen counter")
+        home_id: the patient's home ID
+        room_id: optional room ID (if we can determine which room)
+
+    Returns:
+        Dict with created tag info, or error details.
+    """
+    import uuid
+
+    tag_data = {
+        "id": str(uuid.uuid4()),
+        "label": item,
+        "position": location,
+        "confidence": "high",
+        "notes": f"Reported by patient via conversation: '{item}' is at '{location}'",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # If we have a room_id, use it. Otherwise try to find a matching room.
+    if room_id:
+        tag_data["room_id"] = room_id
+    else:
+        # Try to infer room from the location description
+        inferred_room = _infer_room_from_location(location, home_id)
+        if inferred_room:
+            tag_data["room_id"] = inferred_room["id"]
+
+    # We need a photo_id for the foreign key, but conversational tags
+    # have no photo. Use a null/placeholder approach — Person B may need
+    # to make photo_id nullable, or we skip the insert if it's required.
+    try:
+        client = _get_client()
+        result = client.table("tags").insert(tag_data).execute()
+        logger.info(
+            "conversational_tag_created item=%s location=%s id=%s",
+            item, location, tag_data["id"],
+        )
+        return {
+            "created": True,
+            "tag": result.data[0] if result.data else tag_data,
+            "message": f"Got it! I'll remember that your {item} is on the {location}.",
+        }
+    except Exception as exc:
+        # If insert fails (e.g., photo_id required), store in-memory as fallback
+        logger.warning(
+            "conversational_tag_insert_failed item=%s error=%s — storing in memory",
+            item, exc,
+        )
+        _in_memory_tags.append(tag_data)
+        return {
+            "created": True,
+            "stored_in_memory": True,
+            "tag": tag_data,
+            "message": f"Got it! I'll remember that your {item} is on the {location}.",
+        }
+
+
+# In-memory fallback for conversational tags when Supabase insert fails
+# (e.g., if photo_id is a required foreign key)
+_in_memory_tags: list[dict] = []
+
+
+def get_in_memory_tags() -> list[dict]:
+    """Return all tags stored in memory (conversational tags that couldn't
+    be persisted to Supabase)."""
+    return list(_in_memory_tags)
+
+
+def _infer_room_from_location(location: str, home_id: str) -> Optional[dict]:
+    """
+    Try to figure out which room the location belongs to by matching
+    room names against the location description.
+
+    E.g., "kitchen counter" contains "kitchen" → match the Kitchen room.
+    """
+    try:
+        client = _get_client()
+        result = (
+            client.table("rooms")
+            .select("id, name")
+            .eq("home_id", home_id)
+            .execute()
+        )
+        location_lower = location.lower()
+        for room in result.data:
+            if room["name"].lower() in location_lower:
+                logger.info(
+                    "inferred_room name=%s from location=%s",
+                    room["name"], location,
+                )
+                return room
+    except Exception as exc:
+        logger.warning("room_inference_failed location=%s error=%s", location, exc)
+    return None
+
+
+async def handle_relocation(
+    user_message: str,
+    home_id: str,
+) -> Optional[dict]:
+    """
+    Full relocation handler: detect intent, find or create the tag, update it.
+
+    This is the main entry point called from the query router when a patient
+    says something like "I put the milk on the kitchen counter".
+
+    Flow:
+        1. Detect relocation intent ("I put X at/on/in Y")
+        2. Search for existing tag matching item X
+        3. If found → update the tag's position to Y
+        4. If NOT found → create a new conversational tag for X at Y
+        5. Return confirmation message
+
+    Args:
+        user_message: the raw patient message
+        home_id: the patient's home ID
+
+    Returns:
+        Response dict with confirmation, or None if no relocation detected.
+    """
+    relocation = detect_relocation(user_message)
+    if relocation is None:
+        return None
+
+    item = relocation["item"]
+    new_location = relocation["new_location"]
+
+    # Try to find an existing tag for this item
+    existing_tag = find_tag_by_item(item, home_id)
+
+    if existing_tag:
+        # Update the existing tag's position
+        result = update_tag_location(existing_tag["id"], new_location)
+        return {
+            "action": "updated",
+            "item": item,
+            "old_location": existing_tag.get("position", "unknown"),
+            "new_location": new_location,
+            "message": (
+                f"Updated! I've moved your {item} from "
+                f"'{existing_tag.get('position', 'its old location')}' to "
+                f"'{new_location}'. I'll remember that for next time."
+            ),
+        }
+    else:
+        # No existing tag — create a new one from conversation
+        result = create_conversational_tag(item, new_location, home_id)
+        return {
+            "action": "created",
+            "item": item,
+            "new_location": new_location,
+            "message": result["message"],
+        }
 
 
 # ---------------------------------------------------------------------------
