@@ -73,11 +73,8 @@ async def ask_question(
     try:
         tags = await get_tags_for_home(home_id)
     except Exception as e:
-        logger.error("query_fetch_error home_id=%s error=%s", home_id, str(e))
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to fetch home data",
-        )
+        logger.warning("query_fetch_error home_id=%s error=%s — continuing with empty tags", home_id, str(e))
+        tags = []
 
     # Build a quick label -> tag lookup for matching
     tag_lookup: dict[str, dict] = {}
