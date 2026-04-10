@@ -56,7 +56,7 @@ export default function VerifyOtpPage() {
 
     sessionStorage.removeItem('pending_email')
     setLoading(false)
-    router.push('/dashboard')
+    router.push('/auth/consent')
   }
 
   return (

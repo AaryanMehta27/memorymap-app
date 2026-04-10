@@ -35,9 +35,8 @@ export default function QueryPage() {
   const supabase = createClient()
 
   useEffect(() => {
-    // Show consent modal once per browser session for patients
-    const consented = sessionStorage.getItem('memorymap_consent')
-    if (!consented) setShowConsent(true)
+    // Show consent modal every time the query page loads
+    setShowConsent(true)
   }, [])
 
   useEffect(() => {
@@ -117,7 +116,6 @@ export default function QueryPage() {
   }
 
   function handleConsentAccept() {
-    sessionStorage.setItem('memorymap_consent', '1')
     setShowConsent(false)
   }
 

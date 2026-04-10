@@ -31,8 +31,8 @@ function LoginForm() {
       return
     }
 
-    // Always go to dashboard — it handles role-based redirect internally
-    router.push('/dashboard')
+    // Go to consent page first — it redirects to dashboard after acceptance
+    router.push('/auth/consent')
   }
 
   return (
