@@ -9,6 +9,7 @@ export default function RegisterPage() {
   const router = useRouter()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [caregiverPhone, setCaregiverPhone] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -32,6 +33,9 @@ export default function RegisterPage() {
     }
 
     sessionStorage.setItem('pending_email', email)
+    if (caregiverPhone.trim()) {
+      sessionStorage.setItem('pending_caregiver_phone', caregiverPhone.trim())
+    }
     router.push('/auth/verify-otp')
   }
 
@@ -53,6 +57,7 @@ export default function RegisterPage() {
               placeholder="you@example.com"
             />
           </div>
+
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
             <input
@@ -64,6 +69,21 @@ export default function RegisterPage() {
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               placeholder="At least 6 characters"
             />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Caregiver&apos;s phone number
+              <span className="text-gray-400 font-normal ml-1">(optional)</span>
+            </label>
+            <input
+              type="tel"
+              value={caregiverPhone}
+              onChange={(e) => setCaregiverPhone(e.target.value)}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              placeholder="+1 (555) 000-0000"
+            />
+            <p className="text-xs text-gray-400 mt-1">Used so patients can call or text their caregiver directly from the app.</p>
           </div>
 
           {error && (

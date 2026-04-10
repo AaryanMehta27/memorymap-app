@@ -38,6 +38,13 @@ export default function VerifyOtpPage() {
     // Create home + user_roles record after verification
     const userId = data.user?.id
     if (userId) {
+      // Save caregiver phone to user metadata if provided
+      const pendingPhone = sessionStorage.getItem('pending_caregiver_phone')
+      if (pendingPhone) {
+        await supabase.auth.updateUser({ data: { caregiver_phone: pendingPhone } })
+        sessionStorage.removeItem('pending_caregiver_phone')
+      }
+
       // Insert home
       const { data: home } = await supabase
         .from('homes')
