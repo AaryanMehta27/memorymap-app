@@ -1,8 +1,9 @@
 const AI_BASE_URL = process.env.NEXT_PUBLIC_AI_API_URL
 
-const USE_MOCK = !AI_BASE_URL || AI_BASE_URL === 'http://localhost:8000'
+const USE_MOCK = false // backend is live on localhost:8000
 
 async function callAI(path: string, body: object, token: string) {
+  console.log('[ai-client] calling', path, 'token length:', token?.length, 'token preview:', token?.slice(0,20))
   const res = await fetch(`${AI_BASE_URL}${path}`, {
     method: 'POST',
     headers: {
@@ -11,7 +12,11 @@ async function callAI(path: string, body: object, token: string) {
     },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`AI service error: ${res.status}`)
+  if (!res.ok) {
+    const errText = await res.text()
+    console.log('[ai-client] error response:', errText)
+    throw new Error(`AI service error: ${res.status}`)
+  }
   return res.json()
 }
 

@@ -22,14 +22,26 @@ export default function NewRoomPage() {
     setLoading(true)
 
     const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
+    const { data: { session } } = await supabase.auth.getSession()
+    const user = session?.user
     if (!user) { router.push('/auth/login'); return }
 
-    const { data: home } = await supabase
+    let { data: home } = await supabase
       .from('homes')
       .select('id')
       .eq('owner_id', user.id)
       .single()
+
+    // Create home if missing
+    if (!home) {
+      const { data: newHome, error: insertErr } = await supabase
+        .from('homes')
+        .insert({ owner_id: user.id, name: 'My Home' })
+        .select('id')
+        .single()
+      if (insertErr) { setError(`Home create error: ${insertErr.message}`); setLoading(false); return }
+      home = newHome
+    }
 
     if (!home) { setError('Could not find your home.'); setLoading(false); return }
 

@@ -31,18 +31,8 @@ function LoginForm() {
       return
     }
 
-    // Check role — patients go to /query, caregivers to /dashboard
-    const { data: roleRow } = await supabase
-      .from('user_roles')
-      .select('role')
-      .eq('user_id', data.user.id)
-      .single()
-
-    if (roleRow?.role === 'patient') {
-      router.push('/query')
-    } else {
-      router.push('/dashboard')
-    }
+    // Always go to dashboard — it handles role-based redirect internally
+    router.push('/dashboard')
   }
 
   return (

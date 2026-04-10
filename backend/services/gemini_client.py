@@ -24,8 +24,8 @@ def _get_client() -> genai.Client:
     return _client
 
 
-VISION_MODEL = "gemini-2.0-flash"
-TEXT_MODEL = "gemini-2.0-flash"
+VISION_MODEL = "gemini-2.5-flash"
+TEXT_MODEL = "gemini-2.5-flash"
 
 PRIVACY_SYSTEM_INSTRUCTION = (
     "You are processing private home photos for an accessibility application "

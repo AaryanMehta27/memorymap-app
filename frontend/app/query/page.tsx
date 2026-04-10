@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { queryHome } from '@/lib/ai-client'
 import { useRouter } from 'next/navigation'
+import { BackgroundConsentModal } from '@/components/BackgroundConsentModal'
 
 interface SourceTag {
   label: string
@@ -15,6 +16,10 @@ interface SourceTag {
 interface QueryResult {
   answer: string
   source_tags: SourceTag[]
+  redirect_message?: string | null
+  is_repeat?: boolean
+  drift_detected?: boolean
+  confidence?: string
 }
 
 export default function QueryPage() {
@@ -25,8 +30,15 @@ export default function QueryPage() {
   const [error, setError] = useState('')
   const [homeId, setHomeId] = useState<string | null>(null)
   const [signedUrls, setSignedUrls] = useState<Record<string, string>>({})
+  const [showConsent, setShowConsent] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const supabase = createClient()
+
+  useEffect(() => {
+    // Show consent modal once per browser session for patients
+    const consented = sessionStorage.getItem('memorymap_consent')
+    if (!consented) setShowConsent(true)
+  }, [])
 
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
@@ -58,9 +70,13 @@ export default function QueryPage() {
       const res = await queryHome(homeId, question.trim(), token)
       setResult(res)
 
-      if (typeof window !== 'undefined' && res.answer) {
+      // Speak the redirect message first if cognitive drift detected, otherwise speak the answer
+      if (typeof window !== 'undefined') {
         window.speechSynthesis.cancel()
-        window.speechSynthesis.speak(new SpeechSynthesisUtterance(res.answer))
+        const textToSpeak = res.redirect_message && res.drift_detected
+          ? res.redirect_message
+          : res.answer
+        window.speechSynthesis.speak(new SpeechSynthesisUtterance(textToSpeak))
       }
 
       if (res.source_tags?.length) {
@@ -100,7 +116,14 @@ export default function QueryPage() {
     recognition.start()
   }
 
+  function handleConsentAccept() {
+    sessionStorage.setItem('memorymap_consent', '1')
+    setShowConsent(false)
+  }
+
   return (
+    <>
+    {showConsent && <BackgroundConsentModal onAccept={handleConsentAccept} />}
     <main className="min-h-[calc(100vh-56px)] flex flex-col max-w-2xl mx-auto px-4 py-8">
       <h1 className="text-3xl font-bold text-gray-900 mb-2">Find something</h1>
       <p className="text-gray-500 mb-8 text-lg">Ask where something is in your home.</p>
@@ -155,6 +178,25 @@ export default function QueryPage() {
 
       {result && (
         <div className="mt-6 flex-1">
+          {/* Cognitive drift / redirect message — shown prominently when drift detected */}
+          {result.redirect_message && result.drift_detected && (
+            <div className="bg-amber-50 border border-amber-300 rounded-2xl px-5 py-4 mb-4 flex gap-3 items-start">
+              <span className="text-2xl shrink-0">💛</span>
+              <div>
+                <p className="text-base text-amber-900 leading-relaxed font-medium">{result.redirect_message}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Repeat query gentle notice */}
+          {result.is_repeat && !result.drift_detected && (
+            <div className="flex items-center gap-2 text-sm text-gray-400 mb-3">
+              <span>🔄</span>
+              <span>You asked about this recently</span>
+            </div>
+          )}
+
+          {/* Main answer */}
           <div className="bg-indigo-50 border border-indigo-200 rounded-2xl px-5 py-4 mb-6">
             <p className="text-xl text-gray-900 leading-relaxed">{result.answer}</p>
           </div>
@@ -188,5 +230,6 @@ export default function QueryPage() {
         </div>
       )}
     </main>
+    </>
   )
 }

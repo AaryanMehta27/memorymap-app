@@ -64,7 +64,7 @@ export default function VerifyOtpPage() {
       <div className="w-full max-w-md bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
         <h1 className="text-2xl font-semibold text-gray-900 mb-1">Check your email</h1>
         <p className="text-sm text-gray-500 mb-6">
-          We sent a 6-digit code to <span className="font-medium text-gray-700">{email}</span>.
+          We sent a verification code to <span className="font-medium text-gray-700">{email}</span>.
           Enter it below to verify your account.
         </p>
 
@@ -76,9 +76,9 @@ export default function VerifyOtpPage() {
               required
               value={otp}
               onChange={(e) => setOtp(e.target.value)}
-              maxLength={6}
+              maxLength={8}
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm tracking-widest text-center focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              placeholder="000000"
+              placeholder="00000000"
               inputMode="numeric"
             />
           </div>

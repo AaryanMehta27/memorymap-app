@@ -103,6 +103,7 @@ export default function RoomDetailPage({ params }: { params: Promise<{ room_id: 
     try {
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? ''
+      console.log('[analyse] session exists:', !!session, 'token length:', token.length, 'preview:', token.slice(0,30))
 
       const imgRes = await fetch(photo.signedUrl)
       const blob = await imgRes.blob()
