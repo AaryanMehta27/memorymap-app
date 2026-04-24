@@ -25,13 +25,62 @@ _STOP_WORDS: set[str] = {
     "where", "is", "my", "the", "are", "did", "i", "put", "find", "can",
     "a", "an", "to", "do", "we", "keep", "need", "want", "some", "it",
     "in", "on", "of", "for", "up", "have", "has", "was", "be", "at",
-    "this", "that", "with",
+    "this", "that", "with", "r", "u", "seen", "left", "got", "seen",
+    "kitchen", "bedroom", "bathroom", "living", "room", "house",
+}
+
+# Maps any alternate word → canonical word used in tag labels
+_SYNONYM_MAP: dict[str, str] = {
+    "specs": "glasses",
+    "spectacles": "glasses",
+    "eyeglasses": "glasses",
+    "eyewear": "glasses",
+    "meds": "medicine",
+    "medication": "medicine",
+    "medications": "medicine",
+    "pills": "medicine",
+    "pill": "medicine",
+    "tablets": "medicine",
+    "tablet": "medicine",
+    "prescription": "medicine",
+    "mobile": "phone",
+    "cell": "phone",
+    "cellphone": "phone",
+    "handphone": "phone",
+    "smartphone": "phone",
+    "telly": "remote",
+    "television": "tv",
+    "remote": "remote",
+    "bag": "purse",
+    "handbag": "purse",
+    "pocketbook": "purse",
+    "hearing": "hearing aid",
+    "earpiece": "hearing aid",
+    "bp": "blood pressure",
+    "keys": "keys",
+    "key": "keys",
+    "wallet": "wallet",
+    "charger": "charger",
+    "notebook": "book",
+    "notepad": "book",
+    "journal": "book",
+    "diary": "book",
+    "cup": "bottle",
+    "glass": "glasses",
 }
 
 
+def _normalize_synonyms(text: str) -> str:
+    """Replace known synonym words with their canonical form."""
+    words = text.lower().split()
+    normalized = [_SYNONYM_MAP.get(w, w) for w in words]
+    return " ".join(normalized)
+
+
 def _tokenize(text: str) -> list[str]:
-    """Lowercase and extract word tokens, removing stop words."""
-    words = re.findall(r"\w+", text.lower())
+    """Normalize synonyms, then extract word tokens removing stop words."""
+    normalized = _normalize_synonyms(text)
+    words = re.findall(r"\w+", normalized)
     return [w for w in words if w not in _STOP_WORDS]
 
 
@@ -97,6 +146,7 @@ class ConversationSession:
     messages: list[dict] = field(default_factory=list)
     asked_items: list[dict] = field(default_factory=list)
     drift_events: list[dict] = field(default_factory=list)
+    alerted_counts: dict = field(default_factory=dict)  # item → last count we alerted at
 
     # ------------------------------------------------------------------
     # Message tracking
@@ -127,7 +177,7 @@ class ConversationSession:
         Compare the current query against previously asked items using
         token-overlap cosine similarity.
 
-        Returns a repeat-event dict if similarity > 0.7 and within 30 min,
+        Returns a repeat-event dict if similarity > 0.5 and within 30 min,
         or None.
         """
         now = datetime.now(timezone.utc)
@@ -144,7 +194,7 @@ class ConversationSession:
             asked_tokens = _tokenize(asked["item"])
             similarity = _cosine_similarity(current_tokens, asked_tokens)
 
-            if similarity > 0.7:
+            if similarity > 0.5:
                 event = {
                     "is_repeat": True,
                     "original_query": asked["item"],
@@ -283,7 +333,11 @@ class ConversationSession:
                 one_hour_items[item] = one_hour_items.get(item, 0) + 1
 
         for item, count in one_hour_items.items():
-            if count >= 4:
+            if count >= 3:
+                last_alerted = self.alerted_counts.get(item, 0)
+                if count == last_alerted:
+                    continue  # already fired alert at this count, skip
+                self.alerted_counts[item] = count
                 logger.warning(
                     "caregiver_alert_repeat user_id=%s item=%s count=%d",
                     self.user_id, item, count,

@@ -1,110 +1,85 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 
-export default function VerifyOtpPage() {
+function VerifyForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const supabase = createClient()
+  const email = searchParams.get('email') ?? ''
+  const isNew = searchParams.get('new') === '1'
   const [otp, setOtp] = useState('')
-  const [email, setEmail] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  useEffect(() => {
-    const stored = sessionStorage.getItem('pending_email')
-    if (!stored) router.push('/auth/register')
-    else setEmail(stored)
-  }, [router])
-
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleVerify(e: React.FormEvent) {
     e.preventDefault()
     setError('')
     setLoading(true)
-
-    const supabase = createClient()
-    const { data, error: verifyError } = await supabase.auth.verifyOtp({
-      email,
-      token: otp.trim(),
-      type: 'signup',
-    })
-
-    if (verifyError) {
-      setLoading(false)
-      setError(verifyError.message)
-      return
-    }
-
-    // Create home + user_roles record after verification
-    const userId = data.user?.id
-    if (userId) {
-      // Save caregiver phone to user metadata if provided
-      const pendingPhone = sessionStorage.getItem('pending_caregiver_phone')
-      if (pendingPhone) {
-        await supabase.auth.updateUser({ data: { caregiver_phone: pendingPhone } })
-        sessionStorage.removeItem('pending_caregiver_phone')
-      }
-
-      // Insert home
-      const { data: home } = await supabase
-        .from('homes')
-        .insert({ owner_id: userId, name: 'My Home' })
-        .select('id')
-        .single()
-
-      if (home) {
-        await supabase.from('user_roles').insert({
-          user_id: userId,
-          role: 'caregiver',
-          home_id: home.id,
-        })
-      }
-    }
-
-    sessionStorage.removeItem('pending_email')
+    const { error } = await supabase.auth.verifyOtp({ email, token: otp.trim(), type: 'email' })
     setLoading(false)
-    router.push('/auth/consent')
+    if (error) { setError(error.message); return }
+    router.push(isNew ? '/auth/consent' : '/dashboard')
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
-      <div className="w-full max-w-md bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
-        <h1 className="text-2xl font-semibold text-gray-900 mb-1">Check your email</h1>
-        <p className="text-sm text-gray-500 mb-6">
-          We sent a verification code to <span className="font-medium text-gray-700">{email}</span>.
-          Enter it below to verify your account.
-        </p>
+    <main className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
+      <div className="w-full max-w-sm">
+        <div className="text-center mb-8">
+          <h1 className="text-3xl font-bold text-indigo-600 tracking-tight mb-1">MemoryMap</h1>
+          <p className="text-sm text-gray-500">Check your email</p>
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Verification code</label>
-            <input
-              type="text"
-              required
-              value={otp}
-              onChange={(e) => setOtp(e.target.value)}
-              maxLength={8}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm tracking-widest text-center focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              placeholder="00000000"
-              inputMode="numeric"
-            />
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
+          <div className="text-center mb-6">
+            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-indigo-50 mb-3">
+              <svg className="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75" />
+              </svg>
+            </div>
+            <p className="text-sm text-gray-600">We sent a verification code to</p>
+            <p className="text-sm font-semibold text-gray-900 mt-0.5">{email}</p>
           </div>
 
-          {error && (
-            <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-              {error}
-            </p>
-          )}
+          <form onSubmit={handleVerify} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1.5 text-center">Verification code</label>
+              <input
+                type="text"
+                required
+                value={otp}
+                onChange={(e) => setOtp(e.target.value)}
+                maxLength={8}
+                inputMode="numeric"
+                placeholder="00000000"
+                className="w-full border border-gray-300 rounded-lg px-3 py-3 text-lg tracking-[0.4em] text-center font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+            </div>
+            {error && (
+              <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                <p className="text-sm text-red-600">{error}</p>
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={loading || otp.length < 6}
+              className="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-lg px-4 py-2.5 transition disabled:opacity-50"
+            >
+              {loading ? 'Verifying...' : 'Verify email'}
+            </button>
+          </form>
+        </div>
 
-          <button
-            type="submit"
-            disabled={loading || otp.length < 6}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg py-2.5 text-sm transition disabled:opacity-50"
-          >
-            {loading ? 'Verifying...' : 'Verify email'}
-          </button>
-        </form>
+        <p className="text-sm text-gray-400 text-center mt-5">
+          Didn&apos;t receive it? Check your spam folder.
+        </p>
       </div>
-    </div>
+    </main>
   )
+}
+
+export default function VerifyOtpPage() {
+  return <Suspense><VerifyForm /></Suspense>
 }

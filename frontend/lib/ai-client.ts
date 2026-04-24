@@ -4,6 +4,8 @@ const USE_MOCK = false // backend is live on localhost:8000
 
 async function callAI(path: string, body: object, token: string) {
   console.log('[ai-client] calling', path, 'token length:', token?.length, 'token preview:', token?.slice(0,20))
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 300_000) // 5 min for Gemma
   const res = await fetch(`${AI_BASE_URL}${path}`, {
     method: 'POST',
     headers: {
@@ -11,7 +13,8 @@ async function callAI(path: string, body: object, token: string) {
       'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify(body),
-  })
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeoutId))
   if (!res.ok) {
     const errText = await res.text()
     console.log('[ai-client] error response:', errText)
@@ -24,7 +27,8 @@ export async function analyzePhoto(
   roomId: string,
   imageBase64: string,
   mimeType: string,
-  token: string
+  token: string,
+  priorityItems?: string[]
 ) {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 1200))
@@ -57,7 +61,12 @@ export async function analyzePhoto(
       ],
     }
   }
-  return callAI('/api/vision/analyze', { room_id: roomId, image_base64: imageBase64, image_mime_type: mimeType }, token)
+  return callAI('/api/vision/analyze', {
+    room_id: roomId,
+    image_base64: imageBase64,
+    image_mime_type: mimeType,
+    ...(priorityItems && priorityItems.length > 0 ? { priority_items: priorityItems } : {}),
+  }, token)
 }
 
 export async function queryHome(homeId: string, question: string, token: string) {

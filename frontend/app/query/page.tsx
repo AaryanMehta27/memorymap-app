@@ -1,95 +1,50 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import { queryHome } from '@/lib/ai-client'
-import { useRouter } from 'next/navigation'
-import { BackgroundConsentModal } from '@/components/BackgroundConsentModal'
 
 interface SourceTag {
   label: string
-  position: string
   room_name: string
-  photo_storage_path: string | null
-}
-
-interface QueryResult {
-  answer: string
-  source_tags: SourceTag[]
-  redirect_message?: string | null
-  is_repeat?: boolean
-  drift_detected?: boolean
-  confidence?: string
+  position: string
+  photo_url?: string | null
 }
 
 export default function QueryPage() {
   const router = useRouter()
+  const supabase = createClient()
+  const [homeId, setHomeId] = useState('')
   const [question, setQuestion] = useState('')
-  const [result, setResult] = useState<QueryResult | null>(null)
+  const [answer, setAnswer] = useState('')
+  const [sourceTags, setSourceTags] = useState<SourceTag[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [homeId, setHomeId] = useState<string | null>(null)
-  const [signedUrls, setSignedUrls] = useState<Record<string, string>>({})
-  const [showConsent, setShowConsent] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
-  const supabase = createClient()
-
-  useEffect(() => {
-    // Show consent modal every time the query page loads
-    setShowConsent(true)
-  }, [])
 
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/auth/login'); return }
-
-      const { data: roleRow } = await supabase
-        .from('user_roles').select('role, home_id').eq('user_id', user.id).single()
-
-      if (roleRow?.home_id) {
-        setHomeId(roleRow.home_id)
-      } else {
-        const { data: home } = await supabase
-          .from('homes').select('id').eq('owner_id', user.id).single()
-        if (home) setHomeId(home.id)
-      }
+      const { data: homeData } = await supabase.from('homes').select('id').eq('owner_id', user.id).single()
+      if (homeData) { setHomeId(homeData.id); return }
+      const { data: roleRow } = await supabase.from('user_roles').select('home_id').eq('user_id', user.id).single()
+      if (roleRow?.home_id) setHomeId(roleRow.home_id)
     })
   }, [])
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleAsk(e: React.FormEvent) {
     e.preventDefault()
-    if (!question.trim() || !homeId) return
+    if (!homeId || !question.trim()) return
     setLoading(true)
     setError('')
-    setResult(null)
-
+    setAnswer('')
+    setSourceTags([])
     try {
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? ''
-      const res = await queryHome(homeId, question.trim(), token)
-      setResult(res)
-
-      // Speak the redirect message first if cognitive drift detected, otherwise speak the answer
-      if (typeof window !== 'undefined') {
-        window.speechSynthesis.cancel()
-        const textToSpeak = res.redirect_message && res.drift_detected
-          ? res.redirect_message
-          : res.answer
-        window.speechSynthesis.speak(new SpeechSynthesisUtterance(textToSpeak))
-      }
-
-      if (res.source_tags?.length) {
-        const urls: Record<string, string> = {}
-        for (const tag of res.source_tags) {
-          if (tag.photo_storage_path) {
-            const { data } = await supabase.storage
-              .from('photos')
-              .createSignedUrl(tag.photo_storage_path, 3600)
-            if (data?.signedUrl) urls[tag.photo_storage_path] = data.signedUrl
-          }
-        }
-        setSignedUrls(urls)
-      }
+      const result = await queryHome(homeId, question, token)
+      setAnswer(result.answer ?? '')
+      setSourceTags(result.source_tags ?? [])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
@@ -97,137 +52,84 @@ export default function QueryPage() {
     }
   }
 
-  function handleAskAgain() {
-    setQuestion('')
-    setResult(null)
-    setError('')
-    window.speechSynthesis?.cancel()
-    setTimeout(() => inputRef.current?.focus(), 50)
-  }
-
-  function handleVoiceInput() {
-    const SR =
-      (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition ||
-      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition
-    if (!SR) return
-    const recognition = new SR()
-    recognition.onresult = (e: SpeechRecognitionEvent) => setQuestion(e.results[0][0].transcript)
-    recognition.start()
-  }
-
-  function handleConsentAccept() {
-    setShowConsent(false)
-  }
-
   return (
-    <>
-    {showConsent && <BackgroundConsentModal onAccept={handleConsentAccept} />}
-    <main className="min-h-[calc(100vh-56px)] flex flex-col max-w-2xl mx-auto px-4 py-8">
-      <h1 className="text-3xl font-bold text-gray-900 mb-2">Find something</h1>
-      <p className="text-gray-500 mb-8 text-lg">Ask where something is in your home.</p>
+    <main className="max-w-2xl mx-auto px-4 py-10">
+      <div className="mb-8">
+        <h1 className="text-2xl font-bold text-gray-900">Find an Item</h1>
+        <p className="text-sm text-gray-500 mt-1">Ask where something is in your home and get an instant answer.</p>
+      </div>
 
-      {!result && !loading && (
-        <form onSubmit={handleSubmit} className="mt-auto">
-          <label className="block text-base font-medium text-gray-700 mb-3">
-            What are you looking for?
-          </label>
-          <div className="flex gap-2">
-            <input
-              ref={inputRef}
-              type="text"
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder="e.g. Where are my glasses?"
-              className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              autoFocus
-            />
-            <button
-              type="button"
-              onClick={handleVoiceInput}
-              className="border border-gray-300 rounded-xl px-4 py-3 text-gray-500 hover:bg-gray-50 transition text-xl"
-              title="Use voice input"
-            >
-              🎤
-            </button>
-            <button
-              type="submit"
-              disabled={!question.trim() || !homeId}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl px-6 py-3 text-base transition disabled:opacity-50"
-            >
-              Ask
-            </button>
-          </div>
+      <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mb-6">
+        <form onSubmit={handleAsk} className="flex gap-3">
+          <input
+            type="text"
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            placeholder="e.g. Where are my glasses?"
+            className="flex-1 border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+          />
+          <button
+            type="submit"
+            disabled={loading || !question.trim()}
+            className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-lg px-5 py-2.5 transition disabled:opacity-50 whitespace-nowrap"
+          >
+            {loading ? 'Searching...' : 'Ask'}
+          </button>
         </form>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 mb-4">
+          <p className="text-sm text-red-600">{error}</p>
+        </div>
       )}
 
       {loading && (
-        <div className="mt-auto flex flex-col items-center justify-center py-16 text-center">
-          <div className="w-10 h-10 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-4" />
-          <p className="text-xl text-gray-600">Looking for your items...</p>
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 flex items-center justify-center gap-3">
+          <div className="w-5 h-5 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
+          <span className="text-sm text-gray-500">Looking through your home...</span>
         </div>
       )}
 
-      {error && (
-        <div className="mt-8">
-          <p className="text-red-600 text-base bg-red-50 border border-red-200 rounded-xl px-4 py-3">{error}</p>
-          <button onClick={handleAskAgain} className="mt-4 text-indigo-600 hover:underline text-base">Try again</button>
-        </div>
-      )}
-
-      {result && (
-        <div className="mt-6 flex-1">
-          {/* Cognitive drift / redirect message — shown prominently when drift detected */}
-          {result.redirect_message && result.drift_detected && (
-            <div className="bg-amber-50 border border-amber-300 rounded-2xl px-5 py-4 mb-4 flex gap-3 items-start">
-              <span className="text-2xl shrink-0">💛</span>
-              <div>
-                <p className="text-base text-amber-900 leading-relaxed font-medium">{result.redirect_message}</p>
-              </div>
+      {answer && !loading && (
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mb-4">
+          <div className="flex items-start gap-3">
+            <div className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center shrink-0 mt-0.5">
+              <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+              </svg>
             </div>
-          )}
-
-          {/* Repeat query gentle notice */}
-          {result.is_repeat && !result.drift_detected && (
-            <div className="flex items-center gap-2 text-sm text-gray-400 mb-3">
-              <span>🔄</span>
-              <span>You asked about this recently</span>
-            </div>
-          )}
-
-          {/* Main answer */}
-          <div className="bg-indigo-50 border border-indigo-200 rounded-2xl px-5 py-4 mb-6">
-            <p className="text-xl text-gray-900 leading-relaxed">{result.answer}</p>
+            <p className="text-gray-800 leading-relaxed text-sm">{answer}</p>
           </div>
+        </div>
+      )}
 
-          {result.source_tags?.length > 0 && (
-            <div className="space-y-3 mb-8">
-              {result.source_tags.map((tag, i) => (
-                <div key={i} className="bg-white border border-gray-200 rounded-xl p-4 flex gap-4 items-start">
-                  {tag.photo_storage_path && signedUrls[tag.photo_storage_path] && (
-                    <img
-                      src={signedUrls[tag.photo_storage_path]}
-                      alt={tag.label}
-                      className="w-20 h-16 object-cover rounded-lg shrink-0"
-                    />
-                  )}
-                  <div>
-                    <p className="font-semibold text-gray-900 text-base">{tag.label}</p>
-                    <p className="text-gray-500 text-sm">{tag.room_name} — {tag.position}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+      {sourceTags.length > 0 && !loading && (
+        <div>
+          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 px-1">Sources</p>
+          <div className="space-y-2">
+            {sourceTags.map((tag, i) => (
+              <div key={i} className="bg-white border border-gray-200 rounded-xl px-4 py-3 flex items-center gap-3 text-sm">
+                <div className="w-2 h-2 rounded-full bg-indigo-400 shrink-0" />
+                <span className="font-medium text-gray-800">{tag.label}</span>
+                <span className="text-gray-300">·</span>
+                <span className="text-gray-500">{tag.room_name}</span>
+                <span className="text-gray-300">·</span>
+                <span className="text-gray-500">{tag.position}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
-          <button
-            onClick={handleAskAgain}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-xl py-3 text-base transition"
-          >
-            Ask again
-          </button>
+      {!answer && !loading && !error && (
+        <div className="text-center py-16 text-gray-400">
+          <svg className="w-10 h-10 mx-auto mb-3 opacity-30" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+          </svg>
+          <p className="text-sm">Type a question above to find something in your home.</p>
         </div>
       )}
     </main>
-    </>
   )
 }

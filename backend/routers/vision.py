@@ -30,7 +30,7 @@ async def analyze_room_photo(
 
     start = time.time()
     try:
-        result = await analyze_image(image_bytes, request.image_mime_type)
+        result = await analyze_image(image_bytes, request.image_mime_type, priority_items=request.priority_items)
     except Exception as e:
         logger.error(
             "vision_analyze_error room_id=%s error=%s",

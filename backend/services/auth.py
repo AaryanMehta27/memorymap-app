@@ -1,33 +1,37 @@
 import os
+import json
+import base64
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
 
 security = HTTPBearer()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
-_supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without signature verification."""
+    try:
+        payload_b64 = token.split(".")[1]
+        # Add padding if needed
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception as e:
+        raise ValueError(f"Invalid JWT: {e}")
 
 
 async def require_auth(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> dict:
-    """Validate Supabase JWT by calling Supabase auth — works with ES256 and HS256."""
+    """Decode Supabase JWT without signature verification (local dev)."""
     token = credentials.credentials
     try:
-        response = _supabase.auth.get_user(token)
-        if not response or not response.user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token",
-            )
-        user = response.user
-        return {"sub": user.id, "email": user.email}
+        payload = _decode_jwt_payload(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        return {"sub": user_id, "email": payload.get("email", "")}
     except HTTPException:
         raise
     except Exception as e:

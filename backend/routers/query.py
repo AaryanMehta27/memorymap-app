@@ -8,6 +8,8 @@ and caregiver alerting.
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
+from rapidfuzz import fuzz
+from services.cognitive_drift import _normalize_synonyms
 
 from models.schemas import QueryRequest, QueryResponse, SourceTag, ConfidenceLevel
 from services.auth import require_auth
@@ -60,7 +62,7 @@ async def ask_question(
         7. Check caregiver alerts
     """
     user_id = user.get("sub", "anonymous")
-    question = request.question
+    question = _normalize_synonyms(request.question)
     home_id = request.home_id
 
     # Get or create conversation session for drift tracking
@@ -76,12 +78,12 @@ async def ask_question(
         logger.warning("query_fetch_error home_id=%s error=%s — continuing with empty tags", home_id, str(e))
         tags = []
 
-    # Build a quick label -> tag lookup for matching
-    tag_lookup: dict[str, dict] = {}
+    # Build a quick label -> [tags] lookup for matching (same item may be in multiple rooms)
+    tag_lookup: dict[str, list[dict]] = {}
     for tag in tags:
         label = tag.get("label", "").lower()
         if label:
-            tag_lookup[label] = tag
+            tag_lookup.setdefault(label, []).append(tag)
 
     # ------------------------------------------------------------------
     # 1. Check for relocation intent
@@ -104,10 +106,10 @@ async def ask_question(
     removed_item = detect_removal(question)
     if removed_item:
         item_key = removed_item.lower()
-        matched_tag = tag_lookup.get(item_key)
+        matched_tag_list = tag_lookup.get(item_key, [])
+        matched_tag = matched_tag_list[0] if matched_tag_list else None
 
         if matched_tag:
-            # Mark as stale/low confidence rather than deleting
             handle_contradiction(matched_tag["id"], matched_tag.get("room_id", ""))
             answer = (
                 f"Noted! I've marked your {removed_item} as no longer there. "
@@ -133,15 +135,14 @@ async def ask_question(
     drift_detected = False
 
     if detect_contradiction(question):
-        # Find the most recently referenced tag to mark as low confidence
-        for label_lower, tag in tag_lookup.items():
+        for label_lower, tag_list in tag_lookup.items():
             if label_lower in question.lower():
+                tag = tag_list[0]
                 result = handle_contradiction(tag["id"], tag.get("room_id", ""))
                 answer = result["message"]
                 session.add_message("assistant", answer)
                 await _maybe_save_session(session)
 
-                # Fire a caregiver alert for contradictions
                 await _fire_alert(
                     patient_id=user_id,
                     home_id=home_id,
@@ -156,7 +157,6 @@ async def ask_question(
                     confidence=ConfidenceLevel.low,
                 )
 
-        # Generic contradiction (no specific tag matched)
         answer = (
             "I'm sorry that wasn't right! Can you tell me which item "
             "you're looking for? I'll update the location."
@@ -170,8 +170,19 @@ async def ask_question(
 
     # ------------------------------------------------------------------
     # 4. Check for cognitive drift (repeats, confusion)
+    # Only run repeat detection on genuine location questions so that
+    # off-topic questions (e.g. "what colour is my phone?") don't
+    # mistakenly match a prior location query for the same item.
     # ------------------------------------------------------------------
-    repeat_event = session.detect_repeat(question)
+    _LOCATION_WORDS = {
+        "where", "find", "locate", "which room", "looking for",
+        "can't find", "cannot find", "have you seen", "seen my",
+        "remind me", "forgot", "forget", "lost my", "put my",
+        "help me find", "remember where", "left my",
+    }
+    _is_location_q = any(w in question.lower() for w in _LOCATION_WORDS)
+
+    repeat_event = session.detect_repeat(question) if _is_location_q else None
     if repeat_event:
         is_repeat = True
         drift_detected = True
@@ -179,6 +190,39 @@ async def ask_question(
             "type": "repeat",
             "detail": repeat_event,
         })
+        session.add_message("assistant", redirect_message)
+
+        original_item = repeat_event.get("original_query", "")
+        original_answer = repeat_event.get("original_answer", "")
+        if original_item:
+            session.record_asked_item(original_item, original_answer)
+
+        await _maybe_save_session(session)
+
+        alert_info = session.should_alert_caregiver()
+        if alert_info:
+            alert_type_str = alert_info.get("alert_type", "repeat_query")
+            try:
+                alert_type = AlertType(alert_type_str)
+            except ValueError:
+                alert_type = AlertType.CONFUSION
+            await _fire_alert(
+                patient_id=user_id,
+                home_id=home_id,
+                alert_type=alert_type,
+                level=AlertLevel.WARNING,
+                message=alert_info.get("message", ""),
+            )
+            logger.info("alert_fired user_id=%s home_id=%s type=%s", user_id, home_id, alert_type_str)
+
+        return QueryResponse(
+            answer=redirect_message,
+            source_tags=[],
+            confidence=ConfidenceLevel.medium,
+            redirect_message=redirect_message,
+            is_repeat=True,
+            drift_detected=True,
+        )
 
     confusion_type = session.detect_confusion(question)
     if confusion_type and not drift_detected:
@@ -197,6 +241,24 @@ async def ask_question(
             "-- ask your caregiver to add some photos."
         )
         session.add_message("assistant", answer)
+        session.record_asked_item(question, answer)
+        await _maybe_save_session(session)
+
+        alert_info = session.should_alert_caregiver()
+        if alert_info:
+            alert_type_str = alert_info.get("alert_type", "repeat_query")
+            try:
+                alert_type = AlertType(alert_type_str)
+            except ValueError:
+                alert_type = AlertType.CONFUSION
+            await _fire_alert(
+                patient_id=user_id,
+                home_id=home_id,
+                alert_type=alert_type,
+                level=AlertLevel.WARNING,
+                message=alert_info.get("message", ""),
+            )
+
         return QueryResponse(
             answer=answer,
             source_tags=[],
@@ -206,16 +268,13 @@ async def ask_question(
             drift_detected=drift_detected,
         )
 
-    # Include any in-memory conversational tags (items reported by patient
-    # that couldn't be saved to Supabase)
     memory_tags = get_in_memory_tags()
     for mt in memory_tags:
         label = mt.get("label", "").lower()
         if label and label not in tag_lookup:
             tags.append(mt)
-            tag_lookup[label] = mt
+            tag_lookup[label] = [mt]
 
-    # Build context with confidence decay annotations
     context_lines: list[str] = []
     for tag in tags:
         room_name = tag.get("rooms", {}).get("name", "Unknown Room")
@@ -232,7 +291,6 @@ async def ask_question(
 
     context = "\n".join(context_lines)
 
-    # Query Gemini
     try:
         answer = await query_with_context(context, question)
     except Exception as e:
@@ -242,28 +300,32 @@ async def ask_question(
             detail="Failed to process query",
         )
 
-    # Prepend redirect message if drift was detected
     if redirect_message:
         answer = f"{redirect_message}\n\n{answer}"
 
-    # Identify which tags were referenced in the answer
-    source_tags: list[SourceTag] = []
-    for label_lower, tag in tag_lookup.items():
-        if label_lower in answer.lower():
-            room_name = tag.get("rooms", {}).get("name", "Unknown Room")
-            photo_path = tag.get("photos", {}).get("storage_path", "")
-            source_tags.append(SourceTag(
-                label=tag.get("label", ""),
-                room_name=room_name,
-                position=tag.get("position", ""),
-                photo_url=photo_path,
-            ))
+    # If the AI refused the question as off-topic, skip source tag matching
+    _off_topic = "i'm only able to help you locate your belongings" in answer.lower()
 
-    # Determine confidence based on effective (decayed) confidence
+    answer_lower = answer.lower()
+    source_tags: list[SourceTag] = []
+    for label_lower, tag_list in tag_lookup.items():
+        if not _off_topic and (label_lower in answer_lower or fuzz.partial_ratio(label_lower, answer_lower) >= 80):
+            for tag in tag_list:
+                room_name = tag.get("rooms", {}).get("name", "Unknown Room")
+                photo_path = tag.get("photos", {}).get("storage_path", "")
+                source_tags.append(SourceTag(
+                    label=tag.get("label", ""),
+                    room_name=room_name,
+                    position=tag.get("position", ""),
+                    photo_url=photo_path,
+                ))
+
     if source_tags:
-        # Use the best effective confidence among matched tags
-        conf_levels = [get_effective_confidence(tag_lookup.get(st.label.lower(), {}))
-                       for st in source_tags]
+        conf_levels = [
+            get_effective_confidence(tag)
+            for st in source_tags
+            for tag in tag_lookup.get(st.label.lower(), [{}])
+        ]
         if "high" in conf_levels:
             confidence = ConfidenceLevel.high
         elif "medium" in conf_levels:
@@ -280,9 +342,12 @@ async def ask_question(
     # ------------------------------------------------------------------
     session.add_message("assistant", answer)
 
-    # Record which items were asked about (for repeat detection)
-    for st in source_tags:
-        session.record_asked_item(st.label, answer)
+    # Record asked items — always record so repeat counter works even without matched tags
+    if source_tags:
+        for st in source_tags:
+            session.record_asked_item(st.label, answer)
+    else:
+        session.record_asked_item(question, answer)
 
     await _maybe_save_session(session)
 
@@ -305,6 +370,7 @@ async def ask_question(
             level=level,
             message=alert_info.get("message", ""),
         )
+        logger.info("alert_fired user_id=%s home_id=%s type=%s", user_id, home_id, alert_type_str)
 
     logger.info(
         "query_ask home_id=%s question_length=%d source_tags=%d drift=%s",

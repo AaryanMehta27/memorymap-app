@@ -18,6 +18,7 @@ class VisionAnalyzeRequest(BaseModel):
     image_mime_type: str = Field(
         ..., pattern=r"^image/(jpeg|png|webp)$"
     )
+    priority_items: list[str] | None = None
 
 
 class Tag(BaseModel):

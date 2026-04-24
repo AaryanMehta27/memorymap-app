@@ -1,183 +1,207 @@
+"""
+AI client using Groq API (replaces local Ollama).
+Text: llama3-8b-8192  |  Vision: meta-llama/llama-4-scout-17b-16e-instruct
+"""
 import os
+import re
 import json
+import base64
 import logging
 import time
 import asyncio
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-_client: genai.Client | None = None
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
+TEXT_MODEL    = os.getenv("GROQ_TEXT_MODEL",   "llama3-8b-8192")
+VISION_MODEL  = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
+_client = None
 
 
-def _get_client() -> genai.Client:
+def _get_client():
     global _client
     if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-        _client = genai.Client(api_key=api_key)
+        from groq import Groq
+        _client = Groq(api_key=GROQ_API_KEY)
     return _client
 
 
-VISION_MODEL = "gemini-2.5-flash"
-TEXT_MODEL = "gemini-2.5-flash"
-
-PRIVACY_SYSTEM_INSTRUCTION = (
-    "You are processing private home photos for an accessibility application "
-    "that helps memory-impaired patients locate their belongings. "
-    "Treat all content as sensitive and private."
-)
-
 VISION_PROMPT = """Analyze this photo of a room. Identify every object, furniture piece, or storage location that would help someone find their belongings.
 
+Pay special attention to SMALL PERSONAL ITEMS:
+- Items resting on flat surfaces (tables, nightstands, countertops, shelves)
+- Glasses, spectacles, or eyeglass cases
+- Medicine bottles, pill organizers, blister packs
+- Small electronics (hearing aids, phones, remote controls)
+- Keys, wallets, lanyards on any surface
+
 For each item return:
-- label: a clear short name (e.g. "medicine cabinet", "bedside drawer")
-- position: where it is in the room (e.g. "left wall near window", "top shelf above desk")
+- label: a clear short name (e.g. "reading glasses")
+- position: where it is in the room (e.g. "nightstand surface")
 - confidence: "high", "medium", or "low"
-- notes: one sentence describing what makes it recognizable or how to locate it
+- notes: one sentence describing how to find it
 
-Focus on: medication, food storage, personal items, appliances, drawers, cabinets, shelves.
-Ignore: bare walls, floors, ceilings unless they have a notable storage feature.
-
-Return ONLY valid JSON, no markdown fences, no explanation:
+Return ONLY valid JSON, no markdown fences:
 {"tags": [...], "raw_description": "one sentence describing the room"}"""
 
-VISION_RETRY_PROMPT = """Your previous response was not valid JSON. Try again.
-
-Analyze this photo of a room. Return ONLY a valid JSON object with this exact structure, nothing else:
-{"tags": [{"label": "string", "position": "string", "confidence": "high|medium|low", "notes": "string"}], "raw_description": "string"}"""
+VISION_RETRY_PROMPT = """Return ONLY a valid JSON object with this exact structure, nothing else:
+{"tags": [{"label": "bedside table", "position": "right side of bed", "confidence": "high", "notes": "Small wooden table with a lamp on top."}], "raw_description": "A bedroom with a bed and bedside table."}"""
 
 
-async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
-    """Send image to Gemini for object detection. Returns parsed dict."""
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-
-    def _call_vision(prompt, part):
-        return _get_client().models.generate_content(
-            model=VISION_MODEL,
-            contents=[prompt, part],
-            config=types.GenerateContentConfig(
-                system_instruction=PRIVACY_SYSTEM_INSTRUCTION,
-            ),
+def _parse_json_response(text: str) -> dict:
+    cleaned = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        brace_pos = min(
+            cleaned.find("{") if "{" in cleaned else len(cleaned),
+            cleaned.find("[") if "[" in cleaned else len(cleaned),
         )
+        if brace_pos < len(cleaned):
+            cleaned = cleaned[brace_pos:]
+    return json.loads(cleaned)
 
-    start = time.time()
-    response = await asyncio.to_thread(_call_vision, VISION_PROMPT, image_part)
-    latency = time.time() - start
 
-    logger.info(
-        "gemini_vision_call model=%s latency=%.2fs",
-        VISION_MODEL, latency,
-    )
-
-    try:
-        result = _parse_json_response(response.text)
-        return result
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Malformed Gemini JSON, retrying with stricter prompt")
-
-    # Retry once with stricter prompt
-    start = time.time()
-    response = await asyncio.to_thread(_call_vision, VISION_RETRY_PROMPT, image_part)
-    latency = time.time() - start
-    logger.info(
-        "gemini_vision_retry model=%s latency=%.2fs",
-        VISION_MODEL, latency,
-    )
-
-    result = _parse_json_response(response.text)
+def _backfill_tags(result: dict) -> dict:
+    for tag in result.get("tags", []):
+        tag.setdefault("label", "unknown item")
+        tag.setdefault("position", "unknown")
+        tag.setdefault("confidence", "low")
+        tag.setdefault("notes", "")
+    result.setdefault("raw_description", "")
     return result
 
 
+async def analyze_image(image_bytes: bytes, mime_type: str, priority_items: list[str] | None = None) -> dict:
+    """Send image to Groq vision model for object detection."""
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url  = f"data:{mime_type};base64,{image_b64}"
+
+    prompt = VISION_PROMPT
+    if priority_items:
+        items_list = "\n".join(f"- {item}" for item in priority_items)
+        prompt = VISION_PROMPT.replace(
+            "\nReturn ONLY valid JSON",
+            f"\n\nPRIORITY ITEMS:\n{items_list}\n\nReturn ONLY valid JSON"
+        )
+
+    def _call_vision(p):
+        return _get_client().chat.completions.create(
+            model=VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text",      "text": p},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            max_tokens=1024,
+        )
+
+    start = time.time()
+    response = await asyncio.to_thread(_call_vision, prompt)
+    logger.info("groq_vision_call model=%s latency=%.2fs", VISION_MODEL, time.time() - start)
+
+    try:
+        result = _parse_json_response(response.choices[0].message.content)
+        return _backfill_tags(result)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Malformed Groq JSON, retrying")
+
+    start = time.time()
+    response = await asyncio.to_thread(_call_vision, VISION_RETRY_PROMPT)
+    logger.info("groq_vision_retry model=%s latency=%.2fs", VISION_MODEL, time.time() - start)
+    result = _parse_json_response(response.choices[0].message.content)
+    return _backfill_tags(result)
+
+
 async def query_with_context(context: str, question: str) -> str:
-    """Text-only query for conversational interface."""
+    """Text query answered by Groq against tagged home data."""
     system = (
         "You are a helpful assistant for a person with memory difficulties. "
-        "Answer questions about where things are in their home based only on "
-        "the location data provided. Be warm, clear, and specific. "
-        "Never guess or fabricate locations.\n\n"
-        "If you find the item, respond in 2-3 sentences including the room name "
-        "and position. If you do not find it, say exactly: "
+        "Your ONLY purpose is to help them find their belongings at home. "
+        "You must ONLY answer questions about where items or belongings are located in their home.\n\n"
+        "IMPORTANT: If the question is NOT about finding or locating an item in the home — "
+        "for example, questions about colours, descriptions, general knowledge, or anything unrelated "
+        "to where something is — respond with EXACTLY this sentence and nothing else:\n"
+        "\"I'm only able to help you locate your belongings at home. "
+        "Please ask me where something is, and I will do my best to assist you.\"\n\n"
+        "For valid location questions:\n"
+        "- Answer based only on the location data provided. Be warm, clear, and specific.\n"
+        "- Never guess or fabricate locations.\n"
+        "- If an item appears in MORE THAN ONE room or location, "
+        "mention ALL locations clearly. For example: 'Your glasses are in two places: "
+        "on the nightstand in the Bedroom, and on the kitchen table in the Kitchen.'\n\n"
+        "The user may use informal or alternative words for items. "
+        "Always match their intent to the closest item in the data. Examples:\n"
+        "- 'specs', 'spectacles', 'eyeglasses' → glasses\n"
+        "- 'meds', 'medication', 'pills', 'tablets', 'medicine cup', 'pill cup', 'medicine bottle' → medicine / pill bottle\n"
+        "- 'mobile', 'cell', 'cellphone' → phone\n"
+        "- 'notebook', 'notepad', 'diary' → book\n"
+        "- 'telly', 'television' → TV/remote\n"
+        "- 'bag', 'handbag' → purse\n"
+        "- 'hearing device', 'earpiece' → hearing aid\n"
+        "- 'BP machine' → blood pressure monitor\n"
+        "- 'cup', 'medicine cup', 'pill cup' → medicine bottle, cup, or any container for medicine\n\n"
+        "Also match items even when phrasing differs slightly — 'medicine cup' should match "
+        "'medicine bottle', 'pill organizer', or any medicine-related tag.\n\n"
+        "If you find the item, respond in 2-3 sentences with the room name and position. "
+        "If not found, say exactly: "
         '"I don\'t have that item tagged in your home yet — ask your caregiver to add it."'
     )
 
-    prompt = f"Home layout data:\n{context}\n\nQuestion: {question}"
-
     def _call_query():
-        return _get_client().models.generate_content(
+        return _get_client().chat.completions.create(
             model=TEXT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-            ),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"Home layout data:\n{context}\n\nQuestion: {question}"},
+            ],
+            max_tokens=256,
+            temperature=0.3,
         )
 
     start = time.time()
     response = await asyncio.to_thread(_call_query)
-    latency = time.time() - start
-
-    logger.info(
-        "gemini_query_call model=%s latency=%.2fs",
-        TEXT_MODEL, latency,
-    )
-
-    return response.text
+    logger.info("groq_query_call model=%s latency=%.2fs", TEXT_MODEL, time.time() - start)
+    return response.choices[0].message.content
 
 
 async def suggest_positions(
     tags: list[dict], room_width_px: int, room_height_px: int
 ) -> list[dict]:
-    """Use Gemini to interpret position descriptions as pixel coordinates."""
+    """Convert position descriptions to pixel coordinates."""
     system = (
         "You convert natural language position descriptions into x/y pixel "
         "coordinates on a rectangular canvas. Return ONLY valid JSON."
     )
-
     tag_descriptions = "\n".join(
         f'- id: "{t["id"]}", label: "{t["label"]}", position: "{t["position"]}"'
         for t in tags
     )
-
     prompt = (
-        f"Canvas dimensions: {room_width_px}px wide x {room_height_px}px tall.\n"
-        f"The origin (0,0) is the top-left corner.\n\n"
-        f"Place these items on the canvas based on their position descriptions:\n"
-        f"{tag_descriptions}\n\n"
+        f"Canvas: {room_width_px}px wide x {room_height_px}px tall. Origin (0,0) = top-left.\n\n"
+        f"Place these items based on their position descriptions:\n{tag_descriptions}\n\n"
         f'Return ONLY valid JSON: {{"placements": [{{"tag_id": "...", "label": "...", "x": 0, "y": 0}}]}}'
     )
 
     def _call_floorplan():
-        return _get_client().models.generate_content(
+        return _get_client().chat.completions.create(
             model=TEXT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-            ),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=512,
+            response_format={"type": "json_object"},
         )
 
     start = time.time()
     response = await asyncio.to_thread(_call_floorplan)
-    latency = time.time() - start
-
-    logger.info(
-        "gemini_floorplan_call model=%s latency=%.2fs",
-        TEXT_MODEL, latency,
-    )
-
-    result = _parse_json_response(response.text)
+    logger.info("groq_floorplan_call model=%s latency=%.2fs", TEXT_MODEL, time.time() - start)
+    result = _parse_json_response(response.choices[0].message.content)
     return result.get("placements", [])
-
-
-def _parse_json_response(text: str) -> dict:
-    """Parse JSON from Gemini response, stripping markdown fences if present."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        cleaned = "\n".join(lines)
-    return json.loads(cleaned)
