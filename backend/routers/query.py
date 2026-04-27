@@ -199,21 +199,24 @@ async def ask_question(
 
         await _maybe_save_session(session)
 
+        urgent_repeat = False
         alert_info = session.should_alert_caregiver()
         if alert_info:
+            urgent_repeat = alert_info.get("notify", False)
             alert_type_str = alert_info.get("alert_type", "repeat_query")
             try:
                 alert_type = AlertType(alert_type_str)
             except ValueError:
                 alert_type = AlertType.CONFUSION
+            level = AlertLevel.URGENT if urgent_repeat else AlertLevel.WARNING
             await _fire_alert(
                 patient_id=user_id,
                 home_id=home_id,
                 alert_type=alert_type,
-                level=AlertLevel.WARNING,
+                level=level,
                 message=alert_info.get("message", ""),
             )
-            logger.info("alert_fired user_id=%s home_id=%s type=%s", user_id, home_id, alert_type_str)
+            logger.info("alert_fired user_id=%s home_id=%s type=%s urgent=%s", user_id, home_id, alert_type_str, urgent_repeat)
 
         return QueryResponse(
             answer=redirect_message,
@@ -222,6 +225,7 @@ async def ask_question(
             redirect_message=redirect_message,
             is_repeat=True,
             drift_detected=True,
+            urgent_repeat=urgent_repeat,
         )
 
     confusion_type = session.detect_confusion(question)

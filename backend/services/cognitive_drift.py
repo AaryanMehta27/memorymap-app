@@ -348,6 +348,7 @@ class ConversationSession:
                         f"Patient has asked about '{item}' {count} times "
                         f"in the last hour."
                     ),
+                    "notify": count >= 5,  # triggers browser notification on caregiver dashboard
                 }
 
         # --- Check confusion signals (3+ in 30 minutes) ---

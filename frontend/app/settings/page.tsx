@@ -6,12 +6,19 @@ import { createClient } from '@/lib/supabase/client'
 
 type DeleteStep = 'idle' | 'confirm' | 'otp' | 'deleting'
 
+interface CaregiverInfo {
+  name: string
+  phone: string
+  email: string
+}
+
 export default function SettingsPage() {
   const router = useRouter()
   const supabase = createClient()
 
   const [email, setEmail] = useState('')
   const [role, setRole] = useState('')
+  const [homeId, setHomeId] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [pwSuccess, setPwSuccess] = useState('')
   const [pwError, setPwError] = useState('')
@@ -20,13 +27,34 @@ export default function SettingsPage() {
   const [deleteOtp, setDeleteOtp] = useState('')
   const [deleteError, setDeleteError] = useState('')
 
+  const [caregiverInfo, setCaregiverInfo] = useState<CaregiverInfo>({ name: '', phone: '', email: '' })
+  const [caregiverSaving, setCaregiverSaving] = useState(false)
+  const [caregiverSuccess, setCaregiverSuccess] = useState('')
+  const [caregiverError, setCaregiverError] = useState('')
+
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/auth/login'); return }
       setEmail(user.email ?? '')
-      const { data: roleRow } = await supabase
-        .from('user_roles').select('role').eq('user_id', user.id).single()
+
+      const [{ data: roleRow }, { data: homeData }] = await Promise.all([
+        supabase.from('user_roles').select('role').eq('user_id', user.id).single(),
+        supabase.from('homes').select('id, caregiver_info').eq('owner_id', user.id).single(),
+      ])
+
       setRole(roleRow?.role ?? '')
+
+      if (homeData) {
+        setHomeId(homeData.id)
+        const ci = (homeData as any).caregiver_info
+        if (ci && typeof ci === 'object') {
+          setCaregiverInfo({
+            name: ci.name ?? '',
+            phone: ci.phone ?? '',
+            email: ci.email ?? '',
+          })
+        }
+      }
     })
   }, [])
 
@@ -40,6 +68,24 @@ export default function SettingsPage() {
     if (error) { setPwError(error.message); return }
     setPwSuccess('Password updated successfully.')
     setNewPassword('')
+  }
+
+  async function handleSaveCaregiverInfo(e: React.FormEvent) {
+    e.preventDefault()
+    if (!homeId) return
+    setCaregiverSaving(true)
+    setCaregiverError('')
+    setCaregiverSuccess('')
+    const { error } = await supabase
+      .from('homes')
+      .update({ caregiver_info: caregiverInfo })
+      .eq('id', homeId)
+    setCaregiverSaving(false)
+    if (error) {
+      setCaregiverError('Could not save. Make sure the caregiver_info column exists in your homes table.')
+    } else {
+      setCaregiverSuccess('Caregiver contact saved.')
+    }
   }
 
   async function handleRequestDeleteOtp() {
@@ -89,6 +135,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="space-y-5">
+        {/* Account info */}
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
           <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4">Account</h2>
           <div className="space-y-3">
@@ -103,6 +150,56 @@ export default function SettingsPage() {
           </div>
         </div>
 
+        {/* Caregiver contact */}
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+          <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-1">Caregiver Contact</h2>
+          <p className="text-sm text-gray-400 mb-4">
+            Add your caregiver&apos;s details. They will be alerted when you ask about the same item repeatedly.
+          </p>
+          <form onSubmit={handleSaveCaregiverInfo} className="space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Caregiver name</label>
+              <input
+                type="text"
+                value={caregiverInfo.name}
+                onChange={(e) => setCaregiverInfo(p => ({ ...p, name: e.target.value }))}
+                placeholder="e.g. Sarah Johnson"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Phone number</label>
+              <input
+                type="tel"
+                value={caregiverInfo.phone}
+                onChange={(e) => setCaregiverInfo(p => ({ ...p, phone: e.target.value }))}
+                placeholder="e.g. +44 7700 900123"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Email address</label>
+              <input
+                type="email"
+                value={caregiverInfo.email}
+                onChange={(e) => setCaregiverInfo(p => ({ ...p, email: e.target.value }))}
+                placeholder="e.g. sarah@example.com"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+            </div>
+            {caregiverError && <p className="text-sm text-red-600">{caregiverError}</p>}
+            {caregiverSuccess && <p className="text-sm text-green-600">{caregiverSuccess}</p>}
+            <button
+              type="submit"
+              disabled={caregiverSaving}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-lg px-4 py-2 transition disabled:opacity-50"
+            >
+              {caregiverSaving ? 'Saving…' : 'Save caregiver contact'}
+            </button>
+          </form>
+        </div>
+
+        {/* Change password */}
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
           <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4">Change Password</h2>
           <form onSubmit={handleChangePassword} className="space-y-3">
@@ -122,20 +219,22 @@ export default function SettingsPage() {
               disabled={pwLoading}
               className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold rounded-lg px-4 py-2 transition disabled:opacity-50"
             >
-              {pwLoading ? 'Saving...' : 'Update password'}
+              {pwLoading ? 'Saving…' : 'Update password'}
             </button>
           </form>
         </div>
 
+        {/* Privacy */}
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
           <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4">Privacy</h2>
           <div className="space-y-2 text-sm text-gray-600">
-            <p>Photos you upload are analysed by a locally-hosted AI model. They are not sent to any external service.</p>
+            <p>Photos you upload are analysed by an AI model. They are not stored beyond what is needed to identify object locations.</p>
             <p>Your room data, tags, and account information are stored in a private database accessible only to your account.</p>
             <p>You can permanently delete all your data at any time using the option below.</p>
           </div>
         </div>
 
+        {/* Danger zone */}
         <div className="bg-white rounded-2xl shadow-sm border border-red-200 p-6">
           <h2 className="text-sm font-semibold text-red-500 uppercase tracking-wider mb-1">Danger Zone</h2>
           <p className="text-sm text-gray-500 mb-4">Permanently delete your account and all associated data. This cannot be undone.</p>
@@ -183,7 +282,7 @@ export default function SettingsPage() {
               <div className="flex gap-2">
                 <button type="button" onClick={() => { setDeleteStep('idle'); setDeleteOtp('') }} className="border border-gray-300 text-gray-600 text-sm rounded-lg px-4 py-2 hover:bg-gray-50">Cancel</button>
                 <button type="submit" disabled={deleteStep === 'deleting' || deleteOtp.length < 6} className="bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg px-4 py-2 transition disabled:opacity-50">
-                  {deleteStep === 'deleting' ? 'Deleting...' : 'Delete my account'}
+                  {deleteStep === 'deleting' ? 'Deleting…' : 'Delete my account'}
                 </button>
               </div>
             </form>

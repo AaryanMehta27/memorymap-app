@@ -56,6 +56,7 @@ class QueryResponse(BaseModel):
     redirect_message: Optional[str] = None
     is_repeat: bool = False
     drift_detected: bool = False
+    urgent_repeat: bool = False  # True when same item asked 5+ times in one hour
 
 
 # --- Floorplan ---

@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
@@ -47,6 +47,20 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [alerts, setAlerts] = useState<Alert[]>([])
   const [token, setToken] = useState<string>('')
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission | 'unsupported'>('default')
+
+  // Keep a ref so the polling interval can access current alerts without stale closure
+  const alertsRef = useRef<Alert[]>([])
+  useEffect(() => { alertsRef.current = alerts }, [alerts])
+
+  useEffect(() => {
+    // Check notification support and current permission
+    if (!('Notification' in window)) {
+      setNotifPermission('unsupported')
+    } else {
+      setNotifPermission(Notification.permission)
+    }
+  }, [])
 
   useEffect(() => {
     const supabase = createClient()
@@ -110,7 +124,7 @@ export default function DashboardPage() {
       setRooms(mapped)
       setLoading(false)
 
-      // Load caregiver alerts from backend
+      // Initial alert load
       if (accessToken) {
         try {
           const res = await fetch(`${AI_BASE_URL}/api/alerts/${homeData.id}`, {
@@ -128,6 +142,47 @@ export default function DashboardPage() {
 
     loadDashboard()
   }, [router])
+
+  // Poll for new alerts every 30 seconds; show browser notification on new urgent ones
+  useEffect(() => {
+    if (!home?.id || !token) return
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${AI_BASE_URL}/api/alerts/${home.id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        const fetched: Alert[] = data.alerts ?? []
+
+        const knownIds = new Set(alertsRef.current.map(a => a.id))
+        const fresh = fetched.filter(a => !knownIds.has(a.id) && !a.acknowledged)
+
+        if (fresh.length > 0) {
+          setAlerts(fetched)
+          // Browser notification for new urgent alerts
+          const urgentFresh = fresh.filter(a => a.level === 'urgent')
+          if (urgentFresh.length > 0 && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+            new Notification('MemoryMap — Urgent Patient Alert', {
+              body: urgentFresh[0].message,
+              icon: '/icon.svg',
+            })
+          }
+        }
+      } catch {
+        // silent — network may be unavailable
+      }
+    }, 30_000)
+
+    return () => clearInterval(interval)
+  }, [home?.id, token])
+
+  async function requestNotificationPermission() {
+    if (!('Notification' in window)) return
+    const permission = await Notification.requestPermission()
+    setNotifPermission(permission)
+  }
 
   function handleAddItem() {
     const trimmed = newItem.trim().toLowerCase()
@@ -179,6 +234,16 @@ export default function DashboardPage() {
           <p className="text-sm text-gray-500 mt-0.5">{rooms.length} room{rooms.length !== 1 ? 's' : ''}</p>
         </div>
         <div className="flex items-center gap-3">
+          {/* Notification permission prompt */}
+          {notifPermission === 'default' && (
+            <button
+              onClick={requestNotificationPermission}
+              title="Enable browser notifications for urgent alerts"
+              className="flex items-center gap-1.5 border border-gray-200 rounded-lg px-3 py-2 text-xs text-gray-500 hover:bg-gray-50 transition"
+            >
+              🔔 Enable alerts
+            </button>
+          )}
           <Link
             href="/alerts"
             className="relative flex items-center gap-2 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition"
@@ -199,6 +264,25 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* Recent urgent alerts inline preview */}
+      {urgentCount > 0 && (
+        <div className="mb-6 space-y-2">
+          {unacknowledgedAlerts.filter(a => a.level === 'urgent').slice(0, 2).map(alert => (
+            <div key={alert.id} className={`border rounded-xl px-4 py-3 flex items-start justify-between gap-3 ${ALERT_LEVEL_STYLES[alert.level]}`}>
+              <div className="flex items-start gap-2 min-w-0">
+                <span className="text-lg shrink-0">{ALERT_LEVEL_ICONS[alert.level]}</span>
+                <p className="text-sm font-medium leading-snug">{alert.message}</p>
+              </div>
+              <button
+                onClick={() => handleAcknowledge(alert.id)}
+                className="text-xs font-medium shrink-0 opacity-60 hover:opacity-100 underline whitespace-nowrap"
+              >
+                Dismiss
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Important items */}
       <div className="mb-8 bg-white border border-gray-200 rounded-xl p-5">
@@ -251,7 +335,7 @@ export default function DashboardPage() {
             disabled={itemsSaving}
             className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2 transition disabled:opacity-50"
           >
-            {itemsSaving ? 'Saving...' : 'Save'}
+            {itemsSaving ? 'Saving…' : 'Save'}
           </button>
         </div>
       </div>
